@@ -35,6 +35,13 @@ def _env_opt_int(name: str) -> int | None:
     return int(raw)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
 def _source_from_env() -> GridTokenZarrSource:
     local_path = os.environ.get("GRID_TOKENS_ZARR_PATH")
     if local_path:
@@ -64,14 +71,25 @@ if sequence_ordering_env not in {"prog_first", "storage"}:
 sequence_ordering: Literal["prog_first", "storage"] = sequence_ordering_env
 max_train_windows = _env_opt_int("GRID_TRAIN_MAX_WINDOWS")
 max_validation_windows = _env_opt_int("GRID_TRAIN_MAX_VALIDATION_WINDOWS")
+max_levels = _env_opt_int("GRID_TRAIN_MAX_LEVELS")
+max_codebooks = _env_opt_int("GRID_TRAIN_MAX_CODEBOOKS")
+use_gpu = _env_bool("GRID_TRAIN_USE_GPU", default=False)
+resource_config = (
+    ResourceConfig.with_gpu(
+        gpu_type=os.environ.get("GRID_TRAIN_GPU_TYPE", "auto"),
+        count=_env_int("GRID_TRAIN_GPU_COUNT", 1),
+    )
+    if use_gpu
+    else ResourceConfig.with_cpu()
+)
 
 grid_tokenized = grid_zarr_to_pretokenized_cache(
     name="tokenized/grid-zarr-tiny-train-cache",
     config=GridZarrTokenizeConfig(
         source=_source_from_env(),
         tokenizer=marin_tokenizer,
-        max_levels=_env_opt_int("GRID_TRAIN_MAX_LEVELS"),
-        max_codebooks=_env_opt_int("GRID_TRAIN_MAX_CODEBOOKS"),
+        max_levels=max_levels if max_levels is not None else 2,
+        max_codebooks=max_codebooks if max_codebooks is not None else 1,
         sequence_ordering=sequence_ordering,
         n_history=_env_int("GRID_TRAIN_HISTORY_STEPS", 2),
         sequence_length=_env_int("GRID_TRAIN_SEQUENCE_LENGTH", 512),
@@ -84,7 +102,7 @@ grid_tokenized = grid_zarr_to_pretokenized_cache(
 
 
 tiny_grid_train_config = SimpleTrainConfig(
-    resources=ResourceConfig.with_cpu(),
+    resources=resource_config,
     train_batch_size=_env_int("GRID_TRAIN_BATCH_SIZE", 4),
     num_train_steps=_env_int("GRID_TRAIN_NUM_STEPS", 100),
     train_seq_len=_env_int("GRID_TRAIN_SEQUENCE_LENGTH", 512),

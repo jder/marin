@@ -360,7 +360,10 @@ class TaggedEvaluator:
                 this_tokens_per_tag = hax.einsum("-> tag", weights, tags)
                 this_loss_per_tag = hax.einsum("-> tag", weights, losses, tags)  # [Tag]
 
-                mean = state.token_avg_loss.add(this_loss / this_tokens, this_tokens)
+                # Some datasets can emit batches with no supervised tokens (all loss weights are 0).
+                # Treat those batches as zero-contribution updates instead of producing 0/0 -> NaN.
+                safe_mean_loss = hax.where(this_tokens > 0, this_loss / this_tokens, 0.0)
+                mean = state.token_avg_loss.add(safe_mean_loss, this_tokens)
                 state = dataclasses.replace(state, token_avg_loss=mean)
 
                 if len(self.dataset.tag_to_index) > 0:
