@@ -108,7 +108,7 @@ tiny_grid_train_config = SimpleTrainConfig(
     train_seq_len=_env_int("GRID_TRAIN_SEQUENCE_LENGTH", 512),
     learning_rate=6e-4,
     weight_decay=0.1,
-    max_eval_batches=4,
+    max_eval_batches=_env_int("GRID_TRAIN_MAX_EVAL_BATCHES", 4),
 )
 
 
