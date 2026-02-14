@@ -5,6 +5,19 @@
 
 This follows the same shape as `experiments/tutorials/train_tiny_model_cpu.py`,
 but replaces text tokenization with a cache-building step from a grid-token Zarr export.
+
+Grid-token context for this experiment:
+- A timestep is flattened over grid levels/pixels/token slots/RVQ codebooks.
+- Token IDs are remapped with per-position codebook offsets so each codebook has
+  its own ID range (same raw code in two codebooks becomes different IDs).
+- Each timestep starts with a dedicated start token; masked/land entries are mapped
+  to a shared land token ID.
+- `sequence_ordering=prog_first` (default) reorders positions so prognostic tokens
+  come before forcing tokens before chunking into fixed-length LM sequences.
+- LM positional embeddings are standard 1..N positions; codebook/slot identity is
+  represented in the token IDs (via the offset remap), not in position indices.
+- Train loss uses non-land tokens across all steps in the history window, while eval
+  loss is concentrated on prognostic, non-land tokens in the final step.
 """
 
 from __future__ import annotations
