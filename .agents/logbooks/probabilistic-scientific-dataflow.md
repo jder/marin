@@ -16,7 +16,7 @@ author: jder
 
 ## Current TL;DR
 
-`PSD-008` collapses scientific values, requested outputs, model calls, and document policy into one staged `InferenceProgram`. `generate` creates a scientific random value and its transformer call; passing that value as later context records the call dependency. `refine` adds explicit feedback calls. `Query`, `QueryLowering`, generic strategy dispatch, and environment allowlists are gone. The compiler now mechanically validates and projects the staged program into inference-plan and transformer-execution IRs. Each call selects full or causal attention and scientific or sequence positions while retaining one ordinary Grug parameter set. Existing smoke evidence remains: an 80-step equal-weight text/science run reduced combined loss from 4.1909 to 0.2022, and a scientific-record permutation changed restored logits by `5.96e-08`. Held-out generalization, LM-authored program generation, dataset availability analysis, compositional position encoders, real text tokenization, and sampled refinement remain untested.
+`PSD-009` adds an interactive document-program layer without adding graph nodes or domain strategies. Ordinary generators yield barriered waves of one or more `Document` values and receive positional per-document observations. `run_programs` mixes independent ready programs, `yield from` handles sequential composition, and `parallel_programs` mixes adaptive children. Three behavior domains now cover unlabeled and supervised refinement, overlapping context windows, and branching specialist composition. Requests explicitly accept sampled, supervised, or corrupted result origins; feedback is preserved per document until a program selects observations and commits them to strict `PredictionState` slots. Existing model evidence remains: an 80-step equal-weight text/science run reduced combined loss from 4.1909 to 0.2022, and a scientific-record permutation changed restored logits by `5.96e-08`. Real model sampling, refinement-quality experiments, durable generator checkpoints, held-out generalization, and LM-authored programs remain untested.
 
 ## Baseline
 
@@ -29,7 +29,6 @@ author: jder
 ### Active
 
 - `PSD-004`: Compositional field, axis, coordinate, topology, and relation embeddings may transfer better than the current learned embedding for each fully qualified scientific position. Next test: add a held-out coordinate or task split before changing the position encoder.
-- `PSD-005`: Refinement training needs sampled proposals instead of truth-valued feedback. Next test: execute one proposal call and materialize its sampled result into the next call.
 
 ### Blocked
 
@@ -47,6 +46,8 @@ None.
 - `PSD-006` (exploratory): Grug calls with zero runtime rotary positions and full segmented attention are equivariant to serialization of complete scientific records. Evidence: the 2026-07-13 semantic-record entry and `test_scientific_record_logits_are_equivariant_to_serialization_order`.
 - `PSD-007` (exploratory): One Grug parameter set can train causal, physically positioned text calls and unordered, scientifically positioned calls when execution data selects positions, masks, and target alignment. Evidence: the 2026-07-13 cross-domain entry and `test_one_grug_model_learns_causal_text_and_full_attention_science`.
 - `PSD-008` (exploratory): One staged Python function can define scientific values, factorization, model-call dependencies, and per-document execution policy without an intermediate query or lowering-strategy API. Evidence: the 2026-07-14 unified inference-program entry and focused behavior tests.
+- `PSD-005` (exploratory): Refinement feedback can use sampled or deliberately corrupted proposals without substituting labels as model inputs. Evidence: unlabeled, labeled, corrupted-feedback, and supervised-origin rejection tests in `test_mock_refinement_program.py`.
+- `PSD-009` (exploratory): Python generators plus one barriered request/result protocol express adaptive refinement, context-window sharding, overlap selection, sequential delegation, parallel adaptive children, branching, retry, and cleanup without domain hooks in the driver. Evidence: the 2026-07-14 interactive-document-program entry and 23 mock/runtime behavior tests.
 
 ## Background Research Brief
 
@@ -175,6 +176,69 @@ Can the execution IR treat serialization as a packing choice while retaining sci
 | Set Transformer | paper | https://arxiv.org/abs/1810.00825 | Attention over unordered inputs | high | ICML 2019 |
 | Graphormer | paper | https://arxiv.org/abs/2106.05234 | Structural rather than serialization encodings | medium | Future relation-bias direction |
 
+## Background Research Brief: Interactive Document Programs
+
+- Effort: low
+- Stop rule: stop once local code and Python's generator specifications identify the minimum falsifiable driver boundary.
+- Date: 2026-07-14
+
+### Question
+
+Can ordinary Python generator composition replace the staged inference graph while preserving document batching, structured prediction identity, adaptive refinement, and inspectable execution?
+
+### Current Marin Context
+
+- `experiments/probabilistic_dataflow/documents.py` already separates stable logical output slots from physical document and packed-row locations.
+- No existing Marin runtime uses two-way generator `send` semantics for model calls; repository generators are conventional one-way readers, context managers, and dataset transforms.
+- The current `InferenceProgram` statically records call dependencies, while `PredictionState` already supports explicit initial writes and refinement replacement after runtime values exist.
+
+### External Prior Art
+
+- PEP 342 defines `send` as resuming a generator and making the sent value the result of its suspended `yield` expression. This directly matches yielding a document request and receiving its predictions.
+- PEP 380 specifies that `yield from` forwards yielded values and sent values between a caller and subgenerator, while preserving a returned subprogram value. This directly supports reusable inference subprograms without a custom composition system.
+
+### Negative / Failed Leads
+
+- Local search found no reusable two-way generator scheduler or model-call coroutine to adopt.
+- A generator frame is ephemeral Python runtime state, so it should not become the durable serialized plan or checkpoint format. Reproducibility needs input, seed, and an execution transcript at yield boundaries.
+- Yielding one document at a time hides parallelism. A useful request must yield a logical step containing one or more documents.
+
+### Recommended Next Experiments
+
+#### 1. Mixed synchronous driver
+
+- Minimum experiment: advance several programs to their next document step, execute those steps as one scheduler batch, route structured results back by step identity, and retain each returned program value.
+- Baseline/control: manually mutate `PredictionState` outside a generator.
+- Expected signal: independent scalar and multi-step programs interleave without domain-specific scheduler branches.
+- Falsifier: the driver must understand domain values, refinement policy, or call topology.
+- Cost/risk: low CPU-only behavior tests.
+- Sources: PEP 342; current `documents.py`.
+
+#### 2. Three unrelated mock domains
+
+- Minimum experiment: context-window-sharded field prediction, adaptive partial refinement, and `yield from` branching/verification.
+- Baseline/control: current static `InferenceProgram` examples.
+- Expected signal: all domain control flow remains ordinary Python and the common API is limited to step/result/driver types.
+- Falsifier: a domain requires a new driver hook, node type, or strategy registry.
+- Cost/risk: low; mocks demonstrate expressiveness rather than model quality.
+- Sources: PEP 380; current output-slot packing tests.
+
+### Hypothesis Queue Update
+
+- Add: `PSD-009`, interactive document programs.
+- Revise: `PSD-005` should test sampled feedback through a generator driver rather than adding refinement semantics to `InferenceProgram`.
+- Falsify / stop: none before the three-domain comparison.
+- Promote: none.
+
+### Source Ledger
+
+| Source | Type | Location | Claim used for | Confidence | Notes |
+|---|---|---|---|---|---|
+| Python PEP 342 | language specification | https://peps.python.org/pep-0342/ | `yield`/`send` implements two-way coroutine exchange | high | Primary Python specification |
+| Python PEP 380 | language specification | https://peps.python.org/pep-0380/ | `yield from` delegates both yielded requests and sent results and returns subprogram values | high | Primary Python specification |
+| Marin local generator search | Marin code | `experiments/`, `lib/`, `tests/` | No existing interactive model-call generator runtime was found | medium | 2026-07-14 `rg` search |
+| Document primitives | Marin code | `experiments/probabilistic_dataflow/documents.py` | Stable output identity is already independent of physical packing | high | Commit `e1b870c66` |
+
 ## Entry Log
 
 ### 2026-07-13 18:31 EDT - PSD-001 kickoff
@@ -266,3 +330,13 @@ Can the execution IR treat serialization as a packing choice while retaining sci
 - Result: `Query`, `QueryLowering`, conditional-query IR, default planning, and environment allowlists were removed. Generated values passed as context now create call dependencies directly. The structure example produces `sequence -> contacts -> distances`; the refinement example produces three dependent calls. Debug reports now show staged values, inference-plan IR, transformer-execution IR, and record treatment. Twelve focused behavior tests and both slow training smoke tests passed; generated reports matched; Marin pre-commit and Pyrefly passed.
 - Interpretation: the DSL is now a typed builder for an inference call DAG and its documents, matching the intended LM-authored workflow. The lower compiler layers remain useful as validated runtime projections, but no second user-authored query representation remains. Dataset availability is intentionally outside this spike rather than represented by an unevaluated environment string.
 - Next action: evaluate whether an LM can reliably author these functions and repair them from compiler diagnostics; do not add a generic planner unless repeated programs demonstrate shared planning pressure.
+
+### 2026-07-14 17:40 EDT - PSD-009 interactive document programs
+
+- Hypothesis: Python generators can express adaptive and composable document production while a domain-neutral driver handles only barriers, batching, routing, and cleanup.
+- Commit Hash: `e867f2164b04bdb2259203e06f638dc765292a76` (implementation in `d8cda9b162be34f00fa1c39e114662d700a9cdd8`)
+- Command: `uv run pytest -q tests/experiment/test_document_programs.py tests/experiment/test_mock_refinement_program.py tests/experiment/test_mock_windowed_program.py tests/experiment/test_mock_composition_program.py tests/experiment/test_probabilistic_dataflow.py -m 'not slow' --maxfail=1`; `uv run pytest -q tests/experiment/test_probabilistic_dataflow.py -m slow --maxfail=1`; `uv run python -m experiments.probabilistic_dataflow.debug_render --check`; `./infra/pre-commit.py --changed-files --fix`.
+- Config: local synchronous fake and packed executors; 23 runtime and mock-domain behavior tests; three mock domains covering partial refinement, overlapping context windows, and branching specialist composition; existing CPU Grug smoke configurations unchanged.
+- Result: 38 non-slow tests and both slow model tests passed. Checked-in debug reports remained current, and Ruff, Black, Pyrefly, license, AST, conflict, TOML/YAML, whitespace, notebook, Markdown, and large-file checks passed. Packed routing preserved repeated document IDs and overlapping slots across mixed attention layouts. Suspended sibling programs closed after executor, child-resume, and cleanup failures.
+- Interpretation: the driver does not need refinement operators, graph nodes, domain registries, or model-call topology. Stable output slots plus positional document occurrences are enough to split and overlap logical predictions. Per-document feedback origins keep sampled, supervised, and corrupted values explicit; unlabeled inference and labeled training use the same document encoding without requiring truth at deployment. Raw generators remain ephemeral, so recorded yield-boundary exchanges support deterministic replay but not durable checkpoint recovery.
+- Next action: connect `packed_executor` to a real sampling backend and measure adaptive refinement quality. Split transcript recording from the default run path before using long-lived programs, and add durable restart semantics only when an actual recovery workflow requires them.
