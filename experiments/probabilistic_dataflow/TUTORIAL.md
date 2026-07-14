@@ -302,6 +302,46 @@ types or the reason for the branch. The full example in
 [`mock_composition.py`](mock_composition.py) also retries rejected geometry and
 checks that suspended child resources close on failure.
 
+### Keep document programs synchronous
+
+`DocumentProgram` is a synchronous generator even when model execution uses
+background work. This matches the interfaces Grug exposes today:
+
+- checkpoint and Hugging Face model loaders are synchronous functions;
+- the training loader consumes `AsyncDataset` values internally, then exposes a
+  normal Python iterator backed by background prefetch;
+- JAX dispatches device computation asynchronously, but a model call returns a
+  `jax.Array` through a synchronous Python interface.
+
+The implementations are in
+[`levanter.model_loading`](../../lib/levanter/src/levanter/model_loading.py),
+[`levanter.data.loader`](../../lib/levanter/src/levanter/data/loader.py), and the
+explicit Grug synchronization point in
+[`experiments/grug/base/train.py`](../grug/base/train.py).
+
+The generator describes dependencies between model calls. The executor owns
+waiting, batching, and device synchronization. A local JAX executor can call the
+model and materialize predictions before returning `DocumentResponse`. A remote
+HTTP or vLLM executor may need `await`, but that changes the driver rather than
+the document program.
+
+The current prototype provides the synchronous `DocumentExecutor` and
+`run_programs`. An async backend should add a separate executor boundary of this
+form:
+
+```python
+class AsyncDocumentExecutor(Protocol):
+    async def __call__(
+        self,
+        requests: tuple[DocumentRequest, ...],
+    ) -> tuple[DocumentResponse, ...]: ...
+```
+
+An `arun_programs` driver would prime and resume the same synchronous generators
+but await this executor between ready waves. Making `DocumentProgram` itself an
+async generator would remove two useful Python operations: async generators
+cannot return the program's final value or delegate with `yield from`.
+
 For a genuinely sequential task, choose
 `DocumentSpec(attention=CAUSAL, positions=SEQUENCE)`. That uses ordinary rotary
 indices and a causal mask. The choice is per call, so it does not require a
