@@ -352,9 +352,7 @@ def supervised_executor(requests: tuple[DocumentRequest, ...]) -> tuple[Document
                 if record.output is None:
                     continue
                 if record.output.supervision is None:
-                    raise ValueError(
-                        f"Document {document.id!r} output {record.output.slot} has no supervised target"
-                    )
+                    raise ValueError(f"Document {document.id!r} output {record.output.slot} has no supervised target")
                 observations.append(
                     PredictionObservation(
                         record.output.slot,
@@ -469,9 +467,7 @@ def _request_difference(actual: DocumentRequest, expected: DocumentRequest) -> s
         return "accepted feedback origins differ"
     if len(actual.documents) != len(expected.documents):
         return "document count differs"
-    for index, (actual_document, expected_document) in enumerate(
-        zip(actual.documents, expected.documents, strict=True)
-    ):
+    for index, (actual_document, expected_document) in enumerate(zip(actual.documents, expected.documents, strict=True)):
         if actual_document != expected_document:
             return f"document {index} differs"
     return "request contents differ"

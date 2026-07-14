@@ -16,9 +16,9 @@ from experiments.probabilistic_dataflow.documents import (
     prediction_input_record,
 )
 from experiments.probabilistic_dataflow.programs import (
+    SAMPLED_FEEDBACK,
     DocumentProgram,
     DocumentRequest,
-    SAMPLED_FEEDBACK,
     highest_logprob_observations,
     prediction_values,
 )

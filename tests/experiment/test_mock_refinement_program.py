@@ -78,9 +78,7 @@ def test_supervised_documents_keep_labels_out_of_sampled_feedback() -> None:
         ),
         mapped_executor(
             lambda document: tuple(
-                PredictionObservation(slot, 10 + slot.index, -0.1)
-                for slot in document.output_slots
-                if slot is not None
+                PredictionObservation(slot, 10 + slot.index, -0.1) for slot in document.output_slots if slot is not None
             )
         ),
     )
@@ -170,9 +168,7 @@ def test_corrupted_proposal_can_drive_refinement_context() -> None:
     )
 
     refinement_context = tuple(
-        record.input_id
-        for record in run.exchanges[1].request.documents[0].records
-        if record.output is None
+        record.input_id for record in run.exchanges[1].request.documents[0].records if record.output is None
     )
     assert refinement_context == (5, 70, 71)
     assert run.value.token_ids == (80, 81)

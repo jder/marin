@@ -15,12 +15,12 @@ from experiments.probabilistic_dataflow.documents import (
     prediction_input_record,
 )
 from experiments.probabilistic_dataflow.programs import (
+    SAMPLED_FEEDBACK,
     DocumentRequest,
     FeedbackOrigin,
     PackedPredictions,
     PredictionObservation,
     ProgramReplayError,
-    SAMPLED_FEEDBACK,
     disjoint_prediction_observations,
     highest_logprob_observations,
     mapped_executor,
@@ -248,9 +248,7 @@ def test_parallel_programs_slice_multi_document_results_by_occurrence() -> None:
         response = yield DocumentRequest(name, documents, SAMPLED_FEEDBACK)
         return tuple(result.observations[0].token_id for result in response.results)
 
-    executor = mapped_executor(
-        lambda document: (PredictionObservation(slot, document.token_ids[0], -0.1),)
-    )
+    executor = mapped_executor(lambda document: (PredictionObservation(slot, document.token_ids[0], -0.1),))
     run = run_program(
         parallel_programs(
             (

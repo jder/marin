@@ -9,10 +9,10 @@ from dataclasses import dataclass, field
 
 from experiments.probabilistic_dataflow.documents import AttentionLayout, Document, Output, OutputSlot, Record
 from experiments.probabilistic_dataflow.programs import (
+    SAMPLED_FEEDBACK,
     DocumentProgram,
     DocumentRequest,
     DocumentResponse,
-    SAMPLED_FEEDBACK,
     parallel_programs,
 )
 
