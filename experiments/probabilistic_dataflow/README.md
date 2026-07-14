@@ -1,21 +1,21 @@
 # Probabilistic scientific dataflow spike
 
-This experiment tests document-level primitives for building heterogeneous
-transformer calls without introducing a new model stack or dataset system. A
-scientist-facing `InferenceProgram` is one encoder into that document library;
-it is not required by the execution and packing APIs. The staged program
-describes:
+This experiment tests a small document library for building heterogeneous
+transformer calls without introducing a new model stack or dataset system.
+The reusable surface has three layers:
 
-- scientifically typed values and their named axes;
-- which values are supplied to each model call;
-- which values each call generates;
-- dependencies between calls;
-- the attention and position policy for each generated document.
+- `Record`, `Document`, and `OutputSlot` encode model inputs and logical outputs;
+- Python generators yield barriered `DocumentRequest` waves and receive
+  per-document prediction observations;
+- executor adapters pack ready documents and route results back to the generator.
 
-There is no separate `Query` object or generic strategy lowerer. Calling
-`program.generate(...)` creates both a scientific random value and the model
-call that will produce it. Passing that returned value as context to a later
-`generate(...)` creates an explicit dependency between the calls.
+Control flow stays in Python. A program can branch, loop, split one prediction
+over several context views, or feed sampled values into a later document. An
+executor does not understand refinement, domain values, or call topology.
+
+The scientist-facing `InferenceProgram` remains one optional static encoder
+into the document library. It is useful when a complete plan must be inspected
+before execution, but packing and interactive execution do not depend on it.
 
 Start with [`TUTORIAL.md`](TUTORIAL.md) for a guided path from a two-record
 scalar prediction through indexed advection, refinement, factorized structure,
@@ -52,6 +52,51 @@ the document library does not choose how competing predictions are combined.
 Causal text uses the same representation: the record containing token `i`
 writes the logical slot for token `i + 1`. Scientific query records instead
 write aligned field-value slots. Both paths use `pack_documents`.
+
+## Interactive document programs
+
+A document source is an ordinary two-way generator:
+
+```python
+def forecast_program(document):
+    response = yield DocumentRequest(
+        "forecast/initial",
+        (document,),
+        SAMPLED_FEEDBACK,
+    )
+    observations = disjoint_prediction_observations(response)
+    return PredictionState().updated(
+        prediction_values(observations),
+        mode=PredictionUpdateMode.REQUIRE_EMPTY,
+    )
+```
+
+Each yielded request is one barrier: all its documents may execute in parallel,
+and the generator resumes only after every document result is available.
+`run_programs` mixes the ready requests from independent programs. Sequential
+subprograms compose with `yield from`; `parallel_programs` is the one small
+combinator needed to expose ready waves from adaptive children together.
+
+Responses preserve document occurrences before observations are combined.
+`results[i]` belongs to `request.documents[i]`; document IDs are descriptive
+and may repeat. This permits overlapping context windows to predict the same
+slot several times. The program must then choose a policy, such as the highest
+log-probability observation, before committing values to `PredictionState`.
+Each result also records whether its values were sampled, supervised, or
+corrupted, and the request declares which origins it accepts.
+
+Three mock domains exercise the boundary:
+
+- [`mock_refinement.py`](mock_refinement.py) performs adaptive partial
+  refinement with unlabeled inference documents and an explicit labeled variant;
+- [`mock_windowed.py`](mock_windowed.py) assembles overlapping context windows
+  and feeds the selected predictions into a continuation document;
+- [`mock_composition.py`](mock_composition.py) uses sequential and parallel
+  subprograms for planning, unequal specialist workloads, verification, and retry.
+
+The driver records yield-boundary exchanges for deterministic replay. A fresh
+generator can consume that transcript and fail at the first changed request;
+the live generator frame is not a serialized plan or checkpoint.
 
 ## Scientist-facing surface
 
@@ -167,6 +212,10 @@ uv run python -m experiments.probabilistic_dataflow.debug_render --check
 - a staged model-call DAG with full or causal attention and scientific or sequence positions;
 - stable logical output slots spanning multiple documents and context views;
 - immutable prediction state with explicit initial-write and refinement-replacement policies;
+- interactive generator programs with barriered multi-document requests;
+- mixed execution of independent programs and parallel adaptive subprograms;
+- per-document feedback provenance and explicit observation-selection policies;
+- yield-boundary transcript replay with divergence detection;
 - parallel generation and fixed-step refinement;
 - factor-dependency preservation and explicit parallel-marginal approximation notes;
 - inference-plan and transformer-execution IRs;
@@ -182,7 +231,9 @@ uv run python -m experiments.probabilistic_dataflow.debug_render --check
 - Values are already discretized synthetic integers, and text uses a tiny fixed vocabulary.
 - An LM generating these Python inference programs is the intended workflow, but is not implemented here.
 - Parallel field generation is a product-of-token-marginals approximation, recorded in the plan.
-- Prediction-state assembly and replacement are implemented, but model sampling and refinement training remain out of scope.
+- Prediction-state assembly and replacement are implemented; model sampling is supplied through executor adapters.
 - Scientific positions use one learned embedding per fully qualified coordinate; compositional axis and topology encoders are not implemented.
 - Calls with different attention layouts are not packed into the same dense batch.
-- Inference sampling, KV-cache execution, adaptive stopping, datasets, simulators, and external effects are out of scope.
+- The mock refinement loop has adaptive stopping, but learned stopping policies and refinement-quality experiments are out of scope.
+- Transcripts currently retain requests and responses in memory and are not a durable checkpoint format.
+- KV-cache execution, datasets, simulators, and external effects are out of scope.

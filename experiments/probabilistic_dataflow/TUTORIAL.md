@@ -226,66 +226,81 @@ call 1`. This is the factorization
 `p(contacts | sequence) p(distances | sequence, contacts)`. It is not replaced
 with one joint call.
 
-### Add fixed-step refinement
+### Add adaptive refinement
 
-`refine` adds another call for an already generated value:
-
-```python
-future = program.generate(
-    "future",
-    trajectory,
-    context=(initial, forcing),
-    document=scientific_document,
-    factor_name="advection_transition",
-)
-program.refine(
-    future,
-    context=(initial, forcing),
-    document=scientific_document,
-    resample_fraction=0.25,
-)
-program.refine(
-    future,
-    context=(initial, forcing),
-    document=scientific_document,
-    resample_fraction=0.25,
-)
-program.finish(future)
-```
-
-The calls form `proposal -> refinement 1 -> refinement 2`. Generated values
-flow between calls; there is still no arbitrary left-to-right order among the
-twelve target coordinates within one call.
-
-The staged debug execution uses the example's true future values to illustrate
-record layout. The document library represents real inference feedback with
-stable output slots and immutable prediction state:
+The static `InferenceProgram.refine` method can still describe a fixed call
+plan. Runtime-dependent refinement is more naturally a Python generator. It
+yields documents and receives structured model results at the same expression:
 
 ```python
-state = PredictionState().updated(
-    first_pass_predictions,
-    mode=PredictionUpdateMode.REQUIRE_EMPTY,
-)
-feedback = tuple(
-    prediction_input_record(state, slot, position_id=0)
-    for slot in selected_slots
-)
-refinement_document = Document(
-    "advection-0/refine-1",
-    (*feedback, *query_records),
-    AttentionLayout.FULL,
-)
-state = state.updated(
-    refinement_predictions,
-    mode=PredictionUpdateMode.REPLACE,
-)
+def refine_field(proposal_documents):
+    response = yield DocumentRequest(
+        "advection/proposal",
+        proposal_documents,
+        SAMPLED_FEEDBACK,
+    )
+    observations = disjoint_prediction_observations(response)
+    state = PredictionState().updated(
+        prediction_values(observations),
+        mode=PredictionUpdateMode.REQUIRE_EMPTY,
+    )
+
+    while selected := tuple(obs.slot for obs in observations if obs.logprob < -0.5):
+        refinement_document = build_refinement_document(state, selected)
+        response = yield DocumentRequest(
+            "advection/refine",
+            (refinement_document,),
+            GENERATED_FEEDBACK,
+        )
+        observations = disjoint_prediction_observations(response)
+        state = state.updated(
+            prediction_values(observations),
+            mode=PredictionUpdateMode.REPLACE,
+        )
+    return state
 ```
 
-The feedback tokens therefore come from the preceding proposal. Refinement may
-query only a selected subset; unselected slots remain unchanged. The same slot
-identity also permits one logical field to be split across documents with
-different context views and assembled after sampling. Model sampling and
-refinement training remain outside this spike.
+The loop, stopping rule, and choice of slots are ordinary Python. The reusable
+runtime only knows that each `DocumentRequest` is a barriered wave. Feedback
+tokens are materialized from `PredictionState`, so the next document consumes
+the proposal produced by the preceding call rather than a training label.
+`REPLACE` rejects unknown slots, which catches a refinement step that silently
+writes a new identity instead of updating its proposal.
+
+The proposal may be split across several documents with different context
+views. Disjoint results assemble directly. Overlapping results remain separate
+`PredictionObservation` values until the program explicitly selects one, for
+example with `highest_logprob_observations`.
+
+Inference construction does not require targets. A separate supervised builder
+attaches labels to the same query records for training while sampled or
+corrupted feedback still supplies the next-round context. See
+[`mock_refinement.py`](mock_refinement.py) and
+[`mock_windowed.py`](mock_windowed.py) for complete executable examples.
+
+### Compose document programs
+
+Sequential subprograms use Python's `yield from`. When independent adaptive
+subprograms should expose their ready documents in the same model wave, use the
+small `parallel_programs` combinator:
+
+```python
+plan = yield from planning_program(example_id)
+geometry, chemistry = yield from parallel_programs(
+    (
+        geometry_program(example_id, plan),
+        chemistry_program(example_id),
+    ),
+    request_prefix=f"{example_id}/specialists",
+)
+accepted = yield from verification_program(example_id, geometry, chemistry)
+```
+
+The geometry branch may yield twice while chemistry yields once. Verification
+starts only after both return. The scheduler sees document waves, not specialist
+types or the reason for the branch. The full example in
+[`mock_composition.py`](mock_composition.py) also retries rejected geometry and
+checks that suspended child resources close on failure.
 
 For a genuinely sequential task, choose
 `DocumentSpec(attention=CAUSAL, positions=SEQUENCE)`. That uses ordinary rotary

@@ -266,6 +266,17 @@ def test_refinement_reads_proposal_state_and_replaces_only_selected_slots() -> N
         state.updated(packed.prediction_values(sampled), mode=PredictionUpdateMode.REQUIRE_EMPTY)
 
 
+def test_prediction_state_replacement_requires_existing_unique_slots() -> None:
+    existing = OutputSlot("forecast-0", "future", 0)
+    missing = OutputSlot("forecast-0", "future", 1)
+    state = PredictionState((PredictionValue(existing, 10),))
+
+    with pytest.raises(ValueError, match="requires existing slots"):
+        state.updated((PredictionValue(missing, 20),), mode=PredictionUpdateMode.REPLACE)
+    with pytest.raises(ValueError, match="same output slot"):
+        PredictionState((PredictionValue(existing, 10), PredictionValue(existing, 11)))
+
+
 def test_unordered_pair_program_is_invariant_to_identity_permutation() -> None:
     program = structure_program()
     pair_axis = program.value("contacts").value_type.axes[0]

@@ -81,18 +81,22 @@ class Document:
     @property
     def target_ids(self) -> tuple[int, ...]:
         return tuple(
-            record.output.supervision.target_id
-            if record.output is not None and record.output.supervision is not None
-            else -1
+            (
+                record.output.supervision.target_id
+                if record.output is not None and record.output.supervision is not None
+                else -1
+            )
             for record in self.records
         )
 
     @property
     def loss_weights(self) -> tuple[float, ...]:
         return tuple(
-            record.output.supervision.weight
-            if record.output is not None and record.output.supervision is not None
-            else 0.0
+            (
+                record.output.supervision.weight
+                if record.output is not None and record.output.supervision is not None
+                else 0.0
+            )
             for record in self.records
         )
 
@@ -116,16 +120,16 @@ class Document:
             raise ValueError("Record order must be a permutation of all document positions")
         return Document(self.id, tuple(self.records[index] for index in order), self.attention_layout)
 
-    def selected(self, id: str, record_indices: tuple[int, ...]) -> Document:
+    def selected(self, document_id: str, record_indices: tuple[int, ...]) -> Document:
         """Create a context view or prediction shard over selected records."""
         if len(set(record_indices)) != len(record_indices):
             raise ValueError("A document view cannot repeat record indices")
         if any(index < 0 or index >= len(self.records) for index in record_indices):
             raise IndexError(f"Record view {record_indices} is outside document length {len(self.records)}")
-        return Document(id, tuple(self.records[index] for index in record_indices), self.attention_layout)
+        return Document(document_id, tuple(self.records[index] for index in record_indices), self.attention_layout)
 
 
-def causal_training_document(id: str, token_ids: tuple[int, ...], *, sequence_name: str) -> Document:
+def causal_training_document(document_id: str, token_ids: tuple[int, ...], *, sequence_name: str) -> Document:
     """Encode shifted next-token supervision as aligned document outputs."""
     if len(token_ids) < 2:
         raise ValueError("Causal training documents require at least two tokens")
@@ -133,10 +137,10 @@ def causal_training_document(id: str, token_ids: tuple[int, ...], *, sequence_na
     for index, token_id in enumerate(token_ids):
         output = None
         if index + 1 < len(token_ids):
-            slot = OutputSlot(id, sequence_name, index + 1)
+            slot = OutputSlot(document_id, sequence_name, index + 1)
             output = Output(slot, Supervision(token_ids[index + 1]))
         records.append(Record(token_id, index, output=output))
-    return Document(id, tuple(records), AttentionLayout.CAUSAL)
+    return Document(document_id, tuple(records), AttentionLayout.CAUSAL)
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,11 @@ class PredictionState:
 
     values: tuple[PredictionValue, ...] = ()
 
+    def __post_init__(self) -> None:
+        slots = [prediction.slot for prediction in self.values]
+        if len(slots) != len(set(slots)):
+            raise ValueError("Prediction state cannot contain the same output slot more than once")
+
     def value(self, slot: OutputSlot) -> int:
         for prediction in self.values:
             if prediction.slot == slot:
@@ -173,9 +182,16 @@ class PredictionState:
             raise ValueError("One prediction update cannot contain the same output slot more than once")
 
         current = {prediction.slot: prediction for prediction in self.values}
-        overlap = current.keys() & prediction_slots
-        if overlap and mode == PredictionUpdateMode.REQUIRE_EMPTY:
-            raise ValueError(f"Prediction update would overwrite existing slots: {sorted(overlap)}")
+        incoming = set(prediction_slots)
+        current_slots = set(current)
+        if mode == PredictionUpdateMode.REQUIRE_EMPTY:
+            overlap = current_slots & incoming
+            if overlap:
+                raise ValueError(f"Prediction update would overwrite existing slots: {sorted(overlap)}")
+        elif mode == PredictionUpdateMode.REPLACE:
+            missing = incoming - current_slots
+            if missing:
+                raise ValueError(f"Prediction replacement requires existing slots: {sorted(missing)}")
         current.update((prediction.slot, prediction) for prediction in predictions)
         return PredictionState(tuple(current[slot] for slot in sorted(current)))
 
@@ -199,6 +215,7 @@ class PackedFeatureIds:
 
 @dataclass(frozen=True)
 class PackedDocumentLocation:
+    document_index: int
     document_id: str
     row: int
     start: int
@@ -207,6 +224,7 @@ class PackedDocumentLocation:
 
 @dataclass(frozen=True)
 class PackedOutputLocation:
+    document_index: int
     slot: OutputSlot
     row: int
     position: int
@@ -237,8 +255,7 @@ class PackedDocuments:
                 f"Sampled tokens must have packed shape {self.token_ids.shape}, got {sampled_token_ids.shape}"
             )
         return tuple(
-            PredictionValue(output.slot, int(sampled_token_ids[output.row, output.position]))
-            for output in self.outputs
+            PredictionValue(output.slot, int(sampled_token_ids[output.row, output.position])) for output in self.outputs
         )
 
 
@@ -254,13 +271,13 @@ def pack_documents(documents: tuple[Document, ...], *, max_seq_len: int) -> Pack
         longest = max(len(document.records) for document in documents)
         raise ValueError(f"Document length {longest} exceeds max_seq_len={max_seq_len}")
 
-    rows: list[list[Document]] = [[]]
+    rows: list[list[tuple[int, Document]]] = [[]]
     row_lengths = [0]
-    for document in documents:
+    for document_index, document in enumerate(documents):
         if row_lengths[-1] + len(document.records) > max_seq_len:
             rows.append([])
             row_lengths.append(0)
-        rows[-1].append(document)
+        rows[-1].append((document_index, document))
         row_lengths[-1] += len(document.records)
 
     shape = (len(rows), max_seq_len)
@@ -276,7 +293,7 @@ def pack_documents(documents: tuple[Document, ...], *, max_seq_len: int) -> Pack
 
     for row_index, row in enumerate(rows):
         offset = 0
-        for segment_id, document in enumerate(row):
+        for segment_id, (document_index, document) in enumerate(row):
             end = offset + len(document.records)
             token_ids[row_index, offset:end] = document.token_ids
             rotary_position_ids[row_index, offset:end] = document.rotary_position_ids
@@ -285,10 +302,10 @@ def pack_documents(documents: tuple[Document, ...], *, max_seq_len: int) -> Pack
             segment_ids[row_index, offset:end] = segment_id
             for channel in channels:
                 feature_arrays[channel][row_index, offset:end] = document.feature_ids(channel)
-            locations.append(PackedDocumentLocation(document.id, row_index, offset, end))
+            locations.append(PackedDocumentLocation(document_index, document.id, row_index, offset, end))
             for position, slot in enumerate(document.output_slots):
                 if slot is not None:
-                    outputs.append(PackedOutputLocation(slot, row_index, offset + position))
+                    outputs.append(PackedOutputLocation(document_index, slot, row_index, offset + position))
             offset = end
 
     return PackedDocuments(
