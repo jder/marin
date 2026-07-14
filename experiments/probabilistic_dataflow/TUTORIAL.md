@@ -1,356 +1,375 @@
-# Tutorial: from one scalar to a shared text-and-science model
+# Tutorial: from one document to adaptive scientific inference
 
 ## Orientation
 
-A language model normally treats each input position as a token in a sentence.
-This prototype can instead treat one position as a scientific value such as
-`future[time=1, cell=0.5]`. We call that position a **record**.
+The reusable API in this experiment has two data structures and one control-flow
+convention:
 
-The transformer is still an ordinary dense model. The DSL describes which
-scientific records to construct, which records may attend to each other, and
-which records have training labels.
+- a `Document` contains the records for one isolated transformer call;
+- an `OutputSlot` identifies a logical prediction independently of the document
+  that requests it;
+- a Python generator yields a `DocumentRequest` and receives the corresponding
+  `DocumentResponse`.
 
-The examples build that idea in five steps:
+The generator owns scientific control flow. It can split one prediction over
+several documents, select among overlapping observations, feed predictions into
+later documents, loop until a stopping condition, and delegate to subprograms.
+The executor owns model batching and result routing.
 
-1. predict one scalar from another;
-2. read the compiler's debug output;
-3. extend the same program to an indexed advection field;
-4. request lower-level control over factorization and refinement;
-5. train one transformer on scientific records and ordinary text.
+This tutorial builds that path in five steps:
 
-The code is an experiment, not a production Marin API. Generate the reports
-used below from the repository root with:
+1. encode one scalar prediction as a document;
+2. yield that document from a program and run it;
+3. split and overlap a logical field across context windows;
+4. add adaptive refinement and subprogram composition;
+5. pack the same document representation for training.
 
-```bash
-uv run python -m experiments.probabilistic_dataflow.debug_render
-```
+The code is an experiment under `experiments/probabilistic_dataflow`, not a
+production Marin API.
 
-## 1. Predict one scalar
+## 1. Encode one scalar prediction
 
-Suppose the current measurement is the integer `3`, and a training example says
-the future measurement is `5`. Both values are discrete IDs from `0` through
-`15`. We want to model `p(future | current)`.
-
-```python
-from experiments.probabilistic_dataflow.dsl import (
-    AttentionPattern,
-    Budget,
-    DocumentSpec,
-    FieldType,
-    InferenceProgram,
-    PositionMode,
-)
-
-measurement = FieldType("measurement", bins=16)
-scientific_document = DocumentSpec(
-    attention=AttentionPattern.FULL,
-    positions=PositionMode.SCIENTIFIC,
-)
-
-program = InferenceProgram(
-    "scalar_forecast",
-    budget=Budget(model_calls=1, generated_tokens=1),
-)
-current = program.input_value("current", measurement)
-future = program.generate(
-    "future",
-    measurement,
-    context=(current,),
-    document=scientific_document,
-    factor_name="scalar_transition",
-)
-program.finish(future)
-```
-
-`FieldType` describes the kind of value. Here `bins=16` means one token chosen
-from 16 possible value tokens. `input_value` introduces a value supplied to a
-model call. `generate` does two things together:
-
-- it defines `future` as a scientific value modeled from `current`;
-- it adds a transformer call that will generate `future` from that context.
-
-`finish(future)` names the program output and checks the call and token budgets.
-There is no separate query or lowering-strategy object.
-
-The `DocumentSpec` is explicit because attention and position have semantic
-consequences. This factor has no meaningful left-to-right order, so it uses full
-attention and scientific identities rather than sequence positions.
-
-## 2. Read the scalar debug dump
-
-A concrete training example supplies realized values:
+Suppose the discretized current value is token `35`, and the training target is
+token `37`. The model input has two records: the observed value and a query for
+the future value.
 
 ```python
-from experiments.probabilistic_dataflow.compiler import TokenCodec, lower_to_transformer
-from experiments.probabilistic_dataflow.synthetic import scalar_forecast_example
+from experiments.probabilistic_dataflow.documents import (
+    AttentionLayout,
+    Document,
+    FeatureId,
+    Output,
+    OutputSlot,
+    Record,
+    Supervision,
+)
 
-example = scalar_forecast_example(program)  # current=3, future=5
-execution = lower_to_transformer(program, example, TokenCodec())
+QUERY_ID = 1
+CURRENT_ID = 35
+TARGET_ID = 37
+
+future_slot = OutputSlot("scalar-0", "future", 0)
+current_feature = (FeatureId("scientific_position", 0),)
+future_feature = (FeatureId("scientific_position", 1),)
+
+inference_document = Document(
+    "scalar-0/inference",
+    (
+        Record(CURRENT_ID, position_id=0, features=current_feature),
+        Record(
+            QUERY_ID,
+            position_id=0,
+            features=future_feature,
+            output=Output(future_slot),
+        ),
+    ),
+    AttentionLayout.FULL,
+)
+
+training_document = Document(
+    "scalar-0/training",
+    (
+        Record(CURRENT_ID, position_id=0, features=current_feature),
+        Record(
+            QUERY_ID,
+            position_id=0,
+            features=future_feature,
+            output=Output(future_slot, Supervision(TARGET_ID)),
+        ),
+    ),
+    AttentionLayout.FULL,
+)
 ```
 
-`future=5` is present in the example so it can become a cross-entropy label. It
-is not fed to the model. The full rendering is
-[`debug_outputs/scalar.md`](debug_outputs/scalar.md).
-
-### Inference Program Values
-
-The first graph shows scientific values and dependencies:
-
-```text
-%0 current : input measurement[scalar]
-    |
-    v
-%1 future  : sample measurement[scalar], factor=scalar_transition
-```
-
-The `FlowInfo` column carries provenance, split keys, and random ancestors for
-later analysis. None of those fields changes the document layout in this
-example.
-
-### Inference Plan IR
-
-The second graph is the model-call schedule recorded by `generate`:
-
-```text
-call 0: generate future from current
-attention: full_segment
-positions: scientific
-```
-
-The plan is a mechanical, validated view of the staged Python program. It is
-useful to compiler and runtime code, but users do not author it separately.
-
-### Transformer Execution IR
-
-The final section shows the exact records sent to the transformer:
-
-| Role | Scientific identity | Model input | Training label |
-| --- | --- | --- | --- |
-| context | `scalar_forecast.current[scalar]` | `value:3` | none |
-| target | `scalar_forecast.future[scalar]` | `<query>` | `value:5` |
-
-At the target record the model sees `<query>` plus the embedding identifying
-`future[scalar]`. It predicts logits there, and cross-entropy compares those
-logits with `value:5`. The target value is only the label.
-
-Every record in this document has rotary position `0`, so RoPE contributes no
-serialization-order signal. The scientific identity embedding distinguishes
-`current` from `future`. Full attention lets both records exchange information.
-Printing `current` first is a packing choice, not part of the scientific model.
-
-## 3. Extend the program to advection
-
-The advection example predicts a field on four spatial cells for three future
-times. It has four initial values, twelve forcing values, and twelve target
-values.
+The inference and training documents have the same model inputs:
 
 ```python
-from experiments.probabilistic_dataflow.dsl import MeshAxis, OrderedAxis
-
-cell = MeshAxis("cell", 4, coordinates=((0.0,), (0.25,), (0.5,), (0.75,)))
-time = OrderedAxis("time", 3)
-
-state = FieldType("state", (cell,), bins=16)
-forcing_type = FieldType("forcing", (time, cell), bins=16)
-trajectory = FieldType("state_trajectory", (time, cell), bins=16)
-
-program = InferenceProgram(
-    "synthetic_advection",
-    budget=Budget(model_calls=1, generated_tokens=12),
-)
-initial = program.input_value("initial", state)
-forcing = program.input_value("forcing", forcing_type)
-future = program.generate(
-    "future",
-    trajectory,
-    context=(initial, forcing),
-    document=scientific_document,
-    factor_name="advection_transition",
-)
-program.finish(future)
+assert inference_document.token_ids == training_document.token_ids == (35, 1)
+assert inference_document.target_ids == (-1, -1)
+assert training_document.target_ids == (-1, 37)
 ```
 
-The DSL did not gain a spatial attention primitive. Named axes expand each
-field into records with meaningful identities. For example:
+`Supervision` is label metadata on an output record. Token `37` is absent from
+`training_document.token_ids`, so full attention cannot leak the target into the
+model input. Both records use rotary position `0`; their `scientific_position`
+features carry the scientific identity used by the existing scientific Grug
+wrapper.
 
-```text
-synthetic_advection.future[time=1,cell=(0.5,)]
-```
+`future_slot` is the identity of the requested value. The document ID is only a
+description of this occurrence. Another document can request the same slot with
+a different context view.
 
-The record counts changed mechanically:
+## 2. Yield documents from a program
 
-| | Scalar | Advection |
-| --- | ---: | ---: |
-| Context records | 1 | 4 initial + 12 forcing |
-| Target records | 1 | 12 future |
-| Total records | 2 | 28 |
-
-See [`debug_outputs/advection.md`](debug_outputs/advection.md). Its plan notes
-that one twelve-token factor is approximated by twelve parallel token
-marginals. All query records see the same context, but independently sampling
-their logits cannot represent correlations among generated coordinates. The
-compiler reports that approximation instead of silently calling it the original
-joint distribution.
-
-## 4. Drop down for control over model calls
-
-Because the staged program is already an inference program, dropping down means
-writing more calls and passing generated values between them.
-
-### Preserve a scientific factorization
-
-The structure example first predicts contacts from a sequence, then predicts
-distances from the sequence and the generated contacts:
+A document program is a normal Python generator. One `yield` submits a barriered
+wave of documents and evaluates to the routed response when the program resumes.
 
 ```python
-contacts = program.generate(
-    "contacts",
-    contacts_type,
-    context=(sequence,),
-    document=scientific_document,
-    factor_name="contact_map",
+from experiments.probabilistic_dataflow.programs import (
+    GENERATED_FEEDBACK,
+    SAMPLED_FEEDBACK,
+    DocumentProgram,
+    DocumentRequest,
+    PredictionObservation,
+    disjoint_prediction_observations,
+    mapped_executor,
+    run_program,
 )
-distances = program.generate(
-    "distances",
-    distance_type,
-    context=(sequence, contacts),
-    document=scientific_document,
-    factor_name="distance_given_contacts",
-)
-program.finish(contacts, distances)
-```
 
-The second call consumes a value produced by the first, so the plan in
-[`debug_outputs/structure.md`](debug_outputs/structure.md) contains `call 0 ->
-call 1`. This is the factorization
-`p(contacts | sequence) p(distances | sequence, contacts)`. It is not replaced
-with one joint call.
 
-### Add adaptive refinement
-
-The static `InferenceProgram.refine` method can still describe a fixed call
-plan. Runtime-dependent refinement is more naturally a Python generator. It
-yields documents and receives structured model results at the same expression:
-
-```python
-def refine_field(proposal_documents):
+def scalar_program(document: Document) -> DocumentProgram[int]:
     response = yield DocumentRequest(
-        "advection/proposal",
-        proposal_documents,
+        "scalar-0/predict",
+        (document,),
         SAMPLED_FEEDBACK,
     )
     observations = disjoint_prediction_observations(response)
-    state = PredictionState().updated(
-        prediction_values(observations),
-        mode=PredictionUpdateMode.REQUIRE_EMPTY,
+    return observations[0].token_id
+
+
+def fake_predict(document: Document) -> tuple[PredictionObservation, ...]:
+    return tuple(
+        PredictionObservation(slot, token_id=38, logprob=-0.2)
+        for slot in document.output_slots
+        if slot is not None
     )
 
-    while selected := tuple(obs.slot for obs in observations if obs.logprob < -0.5):
-        refinement_document = build_refinement_document(state, selected)
-        response = yield DocumentRequest(
-            "advection/refine",
-            (refinement_document,),
-            GENERATED_FEEDBACK,
-        )
-        observations = disjoint_prediction_observations(response)
-        state = state.updated(
-            prediction_values(observations),
-            mode=PredictionUpdateMode.REPLACE,
-        )
-    return state
-```
 
-The loop, stopping rule, and choice of slots are ordinary Python. The reusable
-runtime only knows that each `DocumentRequest` is a barriered wave. Feedback
-tokens are materialized from `PredictionState`, so the next document consumes
-the proposal produced by the preceding call rather than a training label.
-`REPLACE` rejects unknown slots, which catches a refinement step that silently
-writes a new identity instead of updating its proposal.
-
-The proposal may be split across several documents with different context
-views. Disjoint results assemble directly. Overlapping results remain separate
-`PredictionObservation` values until the program explicitly selects one, for
-example with `highest_logprob_observations`.
-
-Inference construction does not require targets. A separate supervised builder
-attaches labels to the same query records for training while sampled or
-corrupted feedback still supplies the next-round context. See
-[`mock_refinement.py`](mock_refinement.py) and
-[`mock_windowed.py`](mock_windowed.py) for complete executable examples.
-
-### Compose document programs
-
-Sequential subprograms use Python's `yield from`. When independent adaptive
-subprograms should expose their ready documents in the same model wave, use the
-small `parallel_programs` combinator:
-
-```python
-plan = yield from planning_program(example_id)
-geometry, chemistry = yield from parallel_programs(
-    (
-        geometry_program(example_id, plan),
-        chemistry_program(example_id),
-    ),
-    request_prefix=f"{example_id}/specialists",
+run = run_program(
+    scalar_program(inference_document),
+    mapped_executor(fake_predict),
 )
-accepted = yield from verification_program(example_id, geometry, chemistry)
+assert run.value == 38
 ```
 
-The geometry branch may yield twice while chemistry yields once. Verification
-starts only after both return. The scheduler sees document waves, not specialist
-types or the reason for the branch. The full example in
-[`mock_composition.py`](mock_composition.py) also retries rejected geometry and
-checks that suspended child resources close on failure.
+`mapped_executor` adapts a per-document function for small local programs and
+tests. A model-backed executor receives all ready requests, packs compatible
+documents, runs the model, and reconstructs the same `DocumentResponse` shape.
+The generator does not change.
 
-### Keep document programs synchronous
+Each `DocumentResult` corresponds positionally to one requested document.
+`results[i]` satisfies `request.documents[i]`. This remains unambiguous when
+document IDs repeat.
 
-`DocumentProgram` is a synchronous generator even when model execution uses
-background work. This matches the interfaces Grug exposes today:
+`run_programs` advances several independent generators together. It collects
+one ready request from each program, executes that wave, and resumes each
+generator with only its response. A later request from one program cannot cross
+that program's preceding yield barrier.
 
-- checkpoint and Hugging Face model loaders are synchronous functions;
-- the training loader consumes `AsyncDataset` values internally, then exposes a
-  normal Python iterator backed by background prefetch;
-- JAX dispatches device computation asynchronously, but a model call returns a
-  `jax.Array` through a synchronous Python interface.
+## 3. Split a prediction across context windows
 
-The implementations are in
-[`levanter.model_loading`](../../lib/levanter/src/levanter/model_loading.py),
-[`levanter.data.loader`](../../lib/levanter/src/levanter/data/loader.py), and the
-explicit Grug synchronization point in
-[`experiments/grug/base/train.py`](../grug/base/train.py).
-
-The generator describes dependencies between model calls. The executor owns
-waiting, batching, and device synchronization. A local JAX executor can call the
-model and materialize predictions before returning `DocumentResponse`. A remote
-HTTP or vLLM executor may need `await`, but that changes the driver rather than
-the document program.
-
-The current prototype provides the synchronous `DocumentExecutor` and
-`run_programs`. An async backend should add a separate executor boundary of this
-form:
+One logical field can span several documents. `ContextWindow` names the context
+tokens and logical field indices requested by each document:
 
 ```python
-class AsyncDocumentExecutor(Protocol):
-    async def __call__(
-        self,
-        requests: tuple[DocumentRequest, ...],
-    ) -> tuple[DocumentResponse, ...]: ...
+from experiments.probabilistic_dataflow.mock_windowed import (
+    ContextWindow,
+    forecast_slot,
+    windowed_forecast_program,
+)
+
+windows = (
+    ContextWindow("left", context_token_ids=(10, 11), output_indices=(0, 1)),
+    ContextWindow("right", context_token_ids=(20, 21), output_indices=(1, 2)),
+)
 ```
 
-An `arun_programs` driver would prime and resume the same synchronous generators
-but await this executor between ready waves. Making `DocumentProgram` itself an
-async generator would remove two useful Python operations: async generators
-cannot return the program's final value or delegate with `yield from`.
+Both windows request index `1`. The response keeps those two observations
+separate until the program applies `highest_logprob_observations`.
 
-For a genuinely sequential task, choose
-`DocumentSpec(attention=CAUSAL, positions=SEQUENCE)`. That uses ordinary rotary
-indices and a causal mask. The choice is per call, so it does not require a
-different transformer architecture.
+```python
+def window_predict(document: Document) -> tuple[PredictionObservation, ...]:
+    context_token = document.token_ids[0]
+    observations = []
+    for slot in document.output_slots:
+        if slot is None:
+            continue
+        if slot.index == 1 and context_token == 10:
+            observations.append(PredictionObservation(slot, token_id=301, logprob=-2.0))
+        elif slot.index == 1:
+            observations.append(PredictionObservation(slot, token_id=401, logprob=-0.2))
+        else:
+            observations.append(PredictionObservation(slot, token_id=300 + slot.index, logprob=-0.1))
+    return tuple(observations)
 
-## 5. Train one transformer on text and science
 
-The cross-domain demo trains one Grug model on causal synthetic text and
-full-attention scientific records:
+run = run_program(
+    windowed_forecast_program(
+        "forecast-0",
+        windows,
+        continuation_output_indices=(3,),
+    ),
+    mapped_executor(window_predict),
+)
+
+state = run.value
+assert tuple(state.value(forecast_slot("forecast-0", index)) for index in range(4)) == (
+    300,
+    401,
+    302,
+    303,
+)
+```
+
+The right window wins index `1` because `-0.2` is greater than `-2.0`. The
+program commits one value per slot to `PredictionState`, materializes indices
+`0`, `1`, and `2` as context records, then yields a continuation document for
+index `3`.
+
+`PredictionState.updated` makes write intent explicit:
+
+- `REQUIRE_EMPTY` inserts predictions and rejects an existing slot;
+- `REPLACE` updates predictions and rejects an unknown slot.
+
+This catches two common routing errors: accidentally committing overlapping
+observations without a selection policy, and refining a newly constructed slot
+instead of the original prediction.
+
+## 4. Refine and compose programs
+
+### Adaptive partial refinement
+
+`iterative_refinement_program` proposes a field, finds coordinates below a
+log-probability threshold, and yields new documents for only those coordinates.
+It does not require target values at inference time.
+
+```python
+from experiments.probabilistic_dataflow.mock_refinement import iterative_refinement_program
+
+refinement = iterative_refinement_program(
+    example_id="field-0",
+    observed_token_ids=(5, 6),
+    num_outputs=4,
+    outputs_per_document=2,
+    minimum_logprob=-0.5,
+    max_refinement_rounds=3,
+    accepted_feedback=SAMPLED_FEEDBACK,
+)
+```
+
+The first request contains two documents, each requesting two disjoint output
+slots. After sampling, the generator stores the four observations and their
+log-probabilities. Each refinement document uses tokens from that sampled state
+as context. Unselected coordinates remain unchanged.
+
+Training uses the same control flow through an explicit labeled constructor:
+
+```python
+from experiments.probabilistic_dataflow.mock_refinement import (
+    supervised_iterative_refinement_program,
+)
+
+training_refinement = supervised_iterative_refinement_program(
+    example_id="field-0",
+    observed_token_ids=(5, 6),
+    target_token_ids=(100, 101, 102, 103),
+    outputs_per_document=2,
+    minimum_logprob=-0.5,
+    max_refinement_rounds=3,
+    accepted_feedback=SAMPLED_FEEDBACK,
+)
+```
+
+The labels supervise each query record. They do not become refinement context.
+For refinement training from deliberately perturbed proposals, use
+`GENERATED_FEEDBACK`, which accepts sampled and corrupted observations while
+still rejecting supervised feedback as runtime state.
+
+### Sequential and parallel subprograms
+
+Normal generator delegation handles sequential composition:
+
+```python
+from experiments.probabilistic_dataflow.mock_composition import (
+    SpecialistResources,
+    chemistry_program,
+    geometry_program,
+    planning_program,
+    verification_program,
+)
+from experiments.probabilistic_dataflow.programs import parallel_programs
+
+
+def specialist_program(
+    example_id: str,
+    resources: SpecialistResources,
+) -> DocumentProgram[tuple[int, int, bool]]:
+    plan = yield from planning_program(example_id)
+    geometry_token, chemistry_token = yield from parallel_programs(
+        (
+            geometry_program(example_id, plan, resources),
+            chemistry_program(example_id, resources),
+        ),
+        request_prefix=f"{example_id}/specialists",
+    )
+    accepted = yield from verification_program(
+        example_id,
+        geometry_token,
+        chemistry_token,
+        attempt=0,
+    )
+    return geometry_token, chemistry_token, accepted
+```
+
+`yield from` handles the planning and verification calls sequentially.
+`parallel_programs` is the small extra combinator needed for adaptive children
+whose ready documents should share execution waves.
+
+The geometry child may yield a coarse document and then a refinement document.
+The chemistry child may finish after one document. `parallel_programs` exposes
+both initial documents together, resumes each child with its positional slice,
+then exposes only geometry's second request. The parent proceeds to verification
+after both children return.
+
+See [`mock_composition.py`](mock_composition.py) for planning, unequal specialist
+workloads, verification, conditional retry, and cleanup of suspended children
+after an executor failure.
+
+## 5. Pack the same documents for training
+
+`pack_documents` converts documents with one attention layout into dense arrays
+while retaining document and output locations:
+
+```python
+from experiments.probabilistic_dataflow.documents import pack_documents
+
+batch = pack_documents((training_document,), max_seq_len=8)
+
+assert batch.token_ids.shape == (1, 8)
+assert batch.target_ids[0, 1] == TARGET_ID
+assert batch.loss_weights[0, 1] == 1.0
+assert batch.outputs[0].slot == future_slot
+```
+
+The packed batch carries:
+
+- input token, feature, and rotary-position IDs;
+- segment IDs that isolate documents in attention;
+- aligned target IDs and loss weights;
+- the physical row and position of each logical `OutputSlot`.
+
+`packed_executor` uses those output locations to route sampled tokens and
+log-probabilities back to document occurrences. It groups ready documents by
+`AttentionLayout`, so full-attention scientific records and causal text use the
+same model parameters in separate dense calls.
+
+Causal text uses the same document representation. The record containing token
+`i` predicts the slot for token `i + 1`:
+
+```python
+from experiments.probabilistic_dataflow.documents import causal_training_document
+
+text_document = causal_training_document(
+    "text-0",
+    token_ids=(2, 3, 4, 5),
+    sequence_name="text",
+)
+assert text_document.attention_layout == AttentionLayout.CAUSAL
+assert text_document.target_ids == (3, 4, 5, -1)
+```
+
+The cross-domain smoke test trains one Grug parameter set on packed causal text
+and full-attention scientific documents:
 
 ```python
 from experiments.probabilistic_dataflow.training import train_cross_domain_smoke
@@ -358,32 +377,17 @@ from experiments.probabilistic_dataflow.training import train_cross_domain_smoke
 result = train_cross_domain_smoke(steps=80, examples_per_task=8, seed=0)
 ```
 
-| | Synthetic text | Synthetic advection |
-| --- | --- | --- |
-| Input unit | word-like token | scientific record |
-| Position signal | rotary index `0..S-1` | scientific identity; rotary position `0` |
-| Attention | causal | full within one example |
-| Label | next token | value aligned with the `<query>` record |
+The checked-in CPU smoke reduced combined training loss from `4.1909` to
+`0.2022`. This demonstrates model and optimization compatibility on a memorized
+synthetic workload. It does not measure held-out scientific prediction,
+language quality, or refinement quality.
 
-Both tasks use the same token embeddings, transformer blocks, and output
-projection. Scientific records additionally use a scientific-identity embedding
-table, which contributes zero to text inputs. The tasks are evaluated as
-separate dense batches because their masks differ, then their losses are
-averaged before one optimizer update.
+Run the document-program behavior tests from the repository root:
 
-[`debug_outputs/cross-domain.md`](debug_outputs/cross-domain.md) places the two
-document types side by side. It shows shifted text labels such as:
-
-```text
-input <text:the> -> label <text:ocean>
+```bash
+uv run pytest -q \
+  tests/experiment/test_document_programs.py \
+  tests/experiment/test_mock_refinement_program.py \
+  tests/experiment/test_mock_windowed_program.py \
+  tests/experiment/test_mock_composition_program.py
 ```
-
-and aligned scientific labels such as:
-
-```text
-input <query> at future[time=0,cell=(0.0,)] -> label value:5
-```
-
-The tiny run is only a compatibility and memorization check. It does not test
-held-out scientific prediction, language quality, cross-task transfer, or a
-complete refinement runtime.

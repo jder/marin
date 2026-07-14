@@ -18,8 +18,9 @@ into the document library. It is useful when a complete plan must be inspected
 before execution, but packing and interactive execution do not depend on it.
 
 Start with [`TUTORIAL.md`](TUTORIAL.md) for a guided path from a two-record
-scalar prediction through indexed advection, refinement, factorized structure,
-and shared text-and-science training.
+scalar prediction through generator execution, overlapping context windows,
+adaptive refinement, subprogram composition, and shared text-and-science
+training.
 
 ## Document library boundary
 
