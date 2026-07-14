@@ -1,8 +1,10 @@
 # Probabilistic scientific dataflow spike
 
-This experiment tests a scientist-facing Python DSL for building scientific
+This experiment tests document-level primitives for building heterogeneous
 transformer calls without introducing a new model stack or dataset system. A
-single staged `InferenceProgram` describes:
+scientist-facing `InferenceProgram` is one encoder into that document library;
+it is not required by the execution and packing APIs. The staged program
+describes:
 
 - scientifically typed values and their named axes;
 - which values are supplied to each model call;
@@ -18,6 +20,38 @@ call that will produce it. Passing that returned value as context to a later
 Start with [`TUTORIAL.md`](TUTORIAL.md) for a guided path from a two-record
 scalar prediction through indexed advection, refinement, factorized structure,
 and shared text-and-science training.
+
+## Document library boundary
+
+The reusable execution boundary consists of immutable `Record`, `Document`,
+`OutputSlot`, `PackedDocuments`, and `PredictionState` values. An output slot
+identifies a logical value independently of the document that predicts it:
+
+```python
+slot = OutputSlot("advection-0", "future", index=7)
+query = Record(
+    input_id=codec.QUERY_ID,
+    position_id=0,
+    output=Output(slot, Supervision(codec.data(true_value))),
+)
+document = Document("advection-0/window-1", records, AttentionLayout.FULL)
+```
+
+Several documents can write disjoint subsets of the same logical slot set.
+Each document may carry a different context view, which permits context-window
+sharding without changing the identity of the requested values. Packing keeps
+the output-slot locations alongside the dense arrays, and sampled values merge
+into one immutable state.
+
+Refinement writes the same slots again with an explicit replacement policy.
+Feedback records are materialized from `PredictionState`, so inference code
+feeds the preceding proposal back into the next document rather than silently
+using a training label. Multiple hypotheses are represented by multiple states;
+the document library does not choose how competing predictions are combined.
+
+Causal text uses the same representation: the record containing token `i`
+writes the logical slot for token `i + 1`. Scientific query records instead
+write aligned field-value slots. Both paths use `pack_documents`.
 
 ## Scientist-facing surface
 
@@ -131,6 +165,8 @@ uv run python -m experiments.probabilistic_dataflow.debug_render --check
 - external inputs, deterministic map/join/select/reduce nodes, and generated values;
 - provenance, split-key, and random-ancestor propagation;
 - a staged model-call DAG with full or causal attention and scientific or sequence positions;
+- stable logical output slots spanning multiple documents and context views;
+- immutable prediction state with explicit initial-write and refinement-replacement policies;
 - parallel generation and fixed-step refinement;
 - factor-dependency preservation and explicit parallel-marginal approximation notes;
 - inference-plan and transformer-execution IRs;
@@ -146,7 +182,7 @@ uv run python -m experiments.probabilistic_dataflow.debug_render --check
 - Values are already discretized synthetic integers, and text uses a tiny fixed vocabulary.
 - An LM generating these Python inference programs is the intended workflow, but is not implemented here.
 - Parallel field generation is a product-of-token-marginals approximation, recorded in the plan.
-- Refinement call graphs compile, but the smoke trainer only trains proposal calls.
+- Prediction-state assembly and replacement are implemented, but model sampling and refinement training remain out of scope.
 - Scientific positions use one learned embedding per fully qualified coordinate; compositional axis and topology encoders are not implemented.
 - Calls with different attention layouts are not packed into the same dense batch.
 - Inference sampling, KV-cache execution, adaptive stopping, datasets, simulators, and external effects are out of scope.

@@ -45,17 +45,17 @@ flowchart LR
 
 | Document | Predicted semantic values | Records | Loss positions |
 | --- | --- | --- | --- |
-| 0 | scalar_forecast.future[scalar] | 2 | 1 |
+| scalar-0/call0/doc0 | scalar_forecast.future[scalar] | 2 | 1 |
 
-### Call 0, document 0
+### Call 0, document `scalar-0/call0/doc0`
 
-- Example: `scalar-0`
+- Document: `scalar-0/call0/doc0`
 - Physical rotary positions: all 0; RoPE is the identity
 - Attention: full_segment within this document's segment; no cross-document attention
 - Serialization: complete records may be permuted; outputs follow the same permutation
 - Loss: 1 aligned target records
 
-| Physical position | Rotary position | Component | Scientific position embedding | Content token | Model treatment | Predicts | Loss |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 0 | context record | scalar_forecast.current[scalar] | 35 value:3 | value token + position policy; no direct loss | - | 0 |
-| 1 | 0 | target record | scalar_forecast.future[scalar] | 1 <query> | query token + position policy; target value is a label, not an input | value:5 | 1 |
+| Physical position | Rotary position | Component | Scientific position embedding | Content token | Model treatment | Logical output slot | Predicts | Loss |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0 | context record | scalar_forecast.current[scalar] | 35 value:3 | value token + position policy; no direct loss | - | - | 0 |
+| 1 | 0 | target record | scalar_forecast.future[scalar] | 1 <query> | query token + position policy; target value is a label, not an input | scalar-0/future[0] | value:5 | 1 |

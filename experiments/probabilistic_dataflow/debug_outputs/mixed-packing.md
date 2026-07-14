@@ -8,6 +8,7 @@ Advection and contact documents share dense rows. Segment IDs keep full attentio
 | --- | --- |
 | shape | 1 rows x 48 tokens |
 | documents | 2 |
+| logical outputs | 18 |
 | supervised tokens | 18 |
 | rotary positions | all 0; RoPE is the identity |
 | attention | full_segment within each segment |

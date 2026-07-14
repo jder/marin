@@ -15,11 +15,16 @@ from levanter.grug.sharding import compact_grug_mesh
 
 from experiments.grug.base.model import GrugModelConfig
 from experiments.probabilistic_dataflow.compiler import (
-    AttentionLayout,
-    PackedBatch,
+    SCIENTIFIC_POSITION_CHANNEL,
     TokenCodec,
     lower_to_transformer,
     pack_transformer_calls,
+)
+from experiments.probabilistic_dataflow.documents import (
+    AttentionLayout,
+    PackedDocuments,
+    causal_training_document,
+    pack_documents,
 )
 from experiments.probabilistic_dataflow.scientific_model import CrossDomainTransformer
 from experiments.probabilistic_dataflow.synthetic import (
@@ -44,13 +49,35 @@ class TrainingResult:
 @dataclass(frozen=True)
 class TaskBatch:
     name: str
-    token_ids: np.ndarray
-    scientific_position_ids: np.ndarray
-    rotary_position_ids: np.ndarray
-    target_ids: np.ndarray
-    loss_weights: np.ndarray
-    segment_ids: np.ndarray
-    attention_layout: AttentionLayout
+    documents: PackedDocuments
+
+    @property
+    def token_ids(self) -> np.ndarray:
+        return self.documents.token_ids
+
+    @property
+    def scientific_position_ids(self) -> np.ndarray:
+        return self.documents.feature_ids(SCIENTIFIC_POSITION_CHANNEL)
+
+    @property
+    def rotary_position_ids(self) -> np.ndarray:
+        return self.documents.rotary_position_ids
+
+    @property
+    def target_ids(self) -> np.ndarray:
+        return self.documents.target_ids
+
+    @property
+    def loss_weights(self) -> np.ndarray:
+        return self.documents.loss_weights
+
+    @property
+    def segment_ids(self) -> np.ndarray:
+        return self.documents.segment_ids
+
+    @property
+    def attention_layout(self) -> AttentionLayout:
+        return self.documents.attention_layout
 
 
 @dataclass(frozen=True)
@@ -91,7 +118,7 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
             codec,
         )
         .calls[0]
-        .sequences[0]
+        .documents[0]
     )
     order = tuple(int(index) for index in np.random.default_rng(seed).permutation(len(sequence.token_ids)))
     permuted = sequence.reordered(order)
@@ -114,13 +141,13 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
         mask = AttentionMask().with_segment_ids(segment_ids)
         logits = model.logits(
             jnp.asarray((sequence.token_ids,)),
-            jnp.asarray((sequence.scientific_position_ids,)),
+            jnp.asarray((sequence.feature_ids(SCIENTIFIC_POSITION_CHANNEL),)),
             mask=mask,
             rotary_position_ids=jnp.asarray((sequence.rotary_position_ids,)),
         )
         permuted_logits = model.logits(
             jnp.asarray((permuted.token_ids,)),
-            jnp.asarray((permuted.scientific_position_ids,)),
+            jnp.asarray((permuted.feature_ids(SCIENTIFIC_POSITION_CHANNEL),)),
             mask=mask,
             rotary_position_ids=jnp.asarray((permuted.rotary_position_ids,)),
         )
@@ -131,7 +158,7 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
 
 def build_mixed_synthetic_batch(
     *, examples_per_problem: int = 8, max_seq_len: int = 64
-) -> tuple[PackedBatch, TokenCodec]:
+) -> tuple[PackedDocuments, TokenCodec]:
     if examples_per_problem <= 0:
         raise ValueError(f"examples_per_problem must be positive, got {examples_per_problem}")
     codec = TokenCodec()
@@ -162,25 +189,15 @@ def build_synthetic_text_batch(codec: TokenCodec, *, repetitions: int = 4) -> Ta
     if repetitions <= 0:
         raise ValueError(f"repetitions must be positive, got {repetitions}")
     sentences = [sentence for _ in range(repetitions) for sentence in TEXT_SENTENCES]
-    token_ids = np.asarray([[codec.token(word) for word in sentence] for sentence in sentences], dtype=np.int32)
-    target_ids = np.full_like(token_ids, -1)
-    target_ids[:, :-1] = token_ids[:, 1:]
-    loss_weights = np.zeros_like(token_ids, dtype=np.float32)
-    loss_weights[:, :-1] = 1.0
-    rotary_position_ids = np.broadcast_to(
-        np.arange(token_ids.shape[1], dtype=np.int32),
-        token_ids.shape,
-    ).copy()
-    return TaskBatch(
-        name="synthetic_text",
-        token_ids=token_ids,
-        scientific_position_ids=np.full_like(token_ids, -1),
-        rotary_position_ids=rotary_position_ids,
-        target_ids=target_ids,
-        loss_weights=loss_weights,
-        segment_ids=np.zeros_like(token_ids),
-        attention_layout=AttentionLayout.CAUSAL,
+    documents = tuple(
+        causal_training_document(
+            f"text-{index}",
+            tuple(codec.token(word) for word in sentence),
+            sequence_name="text",
+        )
+        for index, sentence in enumerate(sentences)
     )
+    return TaskBatch("synthetic_text", pack_documents(documents, max_seq_len=len(TEXT_SENTENCES[0])))
 
 
 def build_synthetic_advection_batch(
@@ -202,16 +219,7 @@ def build_synthetic_advection_batch(
         for seed in range(examples)
     )
     packed = pack_transformer_calls(executions, max_seq_len=max_seq_len)
-    return TaskBatch(
-        name="synthetic_advection",
-        token_ids=packed.token_ids,
-        scientific_position_ids=packed.scientific_position_ids,
-        rotary_position_ids=packed.rotary_position_ids,
-        target_ids=packed.target_ids,
-        loss_weights=packed.loss_weights,
-        segment_ids=packed.segment_ids,
-        attention_layout=packed.attention_layout,
-    )
+    return TaskBatch("synthetic_advection", packed)
 
 
 def train_smoke(
@@ -248,7 +256,7 @@ def train_smoke(
         )
         opt_state = optimizer.init(model)
         token_ids = jnp.asarray(batch.token_ids)
-        scientific_position_ids = jnp.asarray(batch.scientific_position_ids)
+        scientific_position_ids = jnp.asarray(batch.feature_ids(SCIENTIFIC_POSITION_CHANNEL))
         rotary_position_ids = jnp.asarray(batch.rotary_position_ids)
         target_ids = jnp.asarray(batch.target_ids)
         loss_weights = jnp.asarray(batch.loss_weights)

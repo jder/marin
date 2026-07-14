@@ -4,10 +4,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
 
 import numpy as np
 
+from experiments.probabilistic_dataflow.documents import (
+    AttentionLayout,
+    Document,
+    FeatureId,
+    Output,
+    OutputSlot,
+    PackedDocuments,
+    Record,
+    Supervision,
+    pack_documents,
+)
 from experiments.probabilistic_dataflow.dsl import (
     AttentionPattern,
     CategoricalAxis,
@@ -18,6 +28,8 @@ from experiments.probabilistic_dataflow.dsl import (
     PositionMode,
     UnorderedPairAxis,
 )
+
+SCIENTIFIC_POSITION_CHANNEL = "scientific_position"
 
 
 class CompilationError(ValueError):
@@ -189,44 +201,12 @@ class TokenCodec:
         return self.DATA_OFFSET + value
 
 
-class AttentionLayout(StrEnum):
-    FULL = "full_segment"
-    CAUSAL = "causal_segment"
-
-
-@dataclass(frozen=True)
-class ExecutionSequenceIR:
-    example_id: str
-    call_id: int
-    sequence_id: int
-    token_ids: tuple[int, ...]
-    scientific_position_ids: tuple[int, ...]
-    rotary_position_ids: tuple[int, ...]
-    target_ids: tuple[int, ...]
-    loss_weights: tuple[float, ...]
-
-    def reordered(self, order: tuple[int, ...]) -> ExecutionSequenceIR:
-        """Return the same scientific records in a different physical order."""
-        if tuple(sorted(order)) != tuple(range(len(self.token_ids))):
-            raise ValueError("Record order must be a permutation of all sequence positions")
-        return ExecutionSequenceIR(
-            self.example_id,
-            self.call_id,
-            self.sequence_id,
-            tuple(self.token_ids[index] for index in order),
-            tuple(self.scientific_position_ids[index] for index in order),
-            tuple(self.rotary_position_ids[index] for index in order),
-            tuple(self.target_ids[index] for index in order),
-            tuple(self.loss_weights[index] for index in order),
-        )
-
-
 @dataclass(frozen=True)
 class TransformerCallExecutionIR:
     call_id: int
     operator: str
     dependency_call_ids: tuple[int, ...]
-    sequences: tuple[ExecutionSequenceIR, ...]
+    documents: tuple[Document, ...]
     attention_layout: AttentionLayout
     position_mode: PositionMode
 
@@ -247,13 +227,13 @@ def lower_to_transformer(
     plan = inference_plan_ir(program)
     calls = []
     for call in plan.calls:
-        sequence = _scientific_record_sequence(program, call, example, codec)
+        document = _scientific_document(program, call, example, codec)
         calls.append(
             TransformerCallExecutionIR(
                 call_id=call.id,
                 operator=call.operator,
                 dependency_call_ids=call.dependency_call_ids,
-                sequences=(sequence,),
+                documents=(document,),
                 attention_layout=call.attention_layout,
                 position_mode=call.position_mode,
             )
@@ -261,39 +241,49 @@ def lower_to_transformer(
     return TransformerExecutionIR(example.id, tuple(calls))
 
 
-def _scientific_record_sequence(
+def _scientific_document(
     program: InferenceProgram,
     call: ModelCallIR,
     example: ConcreteExample,
     codec: TokenCodec,
-) -> ExecutionSequenceIR:
-    tokens: list[int] = []
-    scientific_positions: list[int] = []
-    target_ids: list[int] = []
-    weights: list[float] = []
+) -> Document:
+    records = []
     for node_id in call.context_ids:
         node = program.node(node_id)
         for index, value in enumerate(example.value(node)):
-            tokens.append(codec.data(value))
-            scientific_positions.append(_position_id(program, node, index, call.position_mode, codec))
-            target_ids.append(-1)
-            weights.append(0.0)
+            scientific_position = _position_id(program, node, index, call.position_mode, codec)
+            features = ()
+            if scientific_position >= 0:
+                features = (FeatureId(SCIENTIFIC_POSITION_CHANNEL, scientific_position),)
+            records.append(
+                Record(
+                    input_id=codec.data(value),
+                    position_id=0 if call.position_mode == PositionMode.SCIENTIFIC else len(records),
+                    features=features,
+                )
+            )
     for target_id in call.target_ids:
         node = program.node(target_id)
         for index, value in enumerate(example.value(node)):
-            tokens.append(codec.QUERY_ID)
-            scientific_positions.append(_position_id(program, node, index, call.position_mode, codec))
-            target_ids.append(codec.data(value))
-            weights.append(1.0)
-    return ExecutionSequenceIR(
-        example.id,
-        call.id,
-        0,
-        tuple(tokens),
-        tuple(scientific_positions),
-        (0,) * len(tokens) if call.position_mode == PositionMode.SCIENTIFIC else tuple(range(len(tokens))),
-        tuple(target_ids),
-        tuple(weights),
+            scientific_position = _position_id(program, node, index, call.position_mode, codec)
+            features = ()
+            if scientific_position >= 0:
+                features = (FeatureId(SCIENTIFIC_POSITION_CHANNEL, scientific_position),)
+            records.append(
+                Record(
+                    input_id=codec.QUERY_ID,
+                    position_id=0 if call.position_mode == PositionMode.SCIENTIFIC else len(records),
+                    features=features,
+                    output=Output(
+                        OutputSlot(example.id, node.name, index),
+                        Supervision(codec.data(value)),
+                    ),
+                )
+            )
+    return Document(
+        id=f"{example.id}/call{call.id}/doc0",
+        records=tuple(records),
+        attention_layout=call.attention_layout,
     )
 
 
@@ -329,85 +319,13 @@ def _scientific_position_key(program: InferenceProgram, node: Node, index: int) 
     return f"{program.name}.{node.name}[{','.join(components)}]"
 
 
-@dataclass(frozen=True)
-class PackedSequenceLocation:
-    example_id: str
-    call_id: int
-    sequence_id: int
-    row: int
-    start: int
-    end: int
-
-
-@dataclass(frozen=True)
-class PackedBatch:
-    token_ids: np.ndarray
-    scientific_position_ids: np.ndarray
-    rotary_position_ids: np.ndarray
-    target_ids: np.ndarray
-    loss_weights: np.ndarray
-    segment_ids: np.ndarray
-    attention_layout: AttentionLayout
-    locations: tuple[PackedSequenceLocation, ...]
-
-
-def pack_transformer_calls(executions: tuple[TransformerExecutionIR, ...], *, max_seq_len: int) -> PackedBatch:
-    attention_layouts = {call.attention_layout for execution in executions for call in execution.calls}
-    if len(attention_layouts) != 1:
-        raise CompilationError(f"Packed calls must share one attention layout, got {sorted(attention_layouts)}")
-    attention_layout = attention_layouts.pop()
-    sequences = [sequence for execution in executions for call in execution.calls for sequence in call.sequences]
-    if not sequences:
-        raise CompilationError("Cannot pack an empty execution")
-    if any(len(sequence.token_ids) > max_seq_len for sequence in sequences):
-        longest = max(len(sequence.token_ids) for sequence in sequences)
-        raise CompilationError(f"Execution sequence length {longest} exceeds max_seq_len={max_seq_len}")
-
-    rows: list[list[ExecutionSequenceIR]] = [[]]
-    row_lengths = [0]
-    for sequence in sequences:
-        if row_lengths[-1] + len(sequence.token_ids) > max_seq_len:
-            rows.append([])
-            row_lengths.append(0)
-        rows[-1].append(sequence)
-        row_lengths[-1] += len(sequence.token_ids)
-
-    shape = (len(rows), max_seq_len)
-    token_ids = np.zeros(shape, dtype=np.int32)
-    scientific_position_ids = np.full(shape, -1, dtype=np.int32)
-    rotary_position_ids = np.zeros(shape, dtype=np.int32)
-    target_ids = np.full(shape, -1, dtype=np.int32)
-    loss_weights = np.zeros(shape, dtype=np.float32)
-    segment_ids = np.full(shape, -1, dtype=np.int32)
-    locations = []
-    for row_index, row in enumerate(rows):
-        offset = 0
-        for segment_id, sequence in enumerate(row):
-            end = offset + len(sequence.token_ids)
-            token_ids[row_index, offset:end] = sequence.token_ids
-            scientific_position_ids[row_index, offset:end] = sequence.scientific_position_ids
-            rotary_position_ids[row_index, offset:end] = sequence.rotary_position_ids
-            target_ids[row_index, offset:end] = sequence.target_ids
-            loss_weights[row_index, offset:end] = sequence.loss_weights
-            segment_ids[row_index, offset:end] = segment_id
-            locations.append(
-                PackedSequenceLocation(
-                    sequence.example_id,
-                    sequence.call_id,
-                    sequence.sequence_id,
-                    row_index,
-                    offset,
-                    end,
-                )
-            )
-            offset = end
-    return PackedBatch(
-        token_ids,
-        scientific_position_ids,
-        rotary_position_ids,
-        target_ids,
-        loss_weights,
-        segment_ids,
-        attention_layout,
-        tuple(locations),
-    )
+def pack_transformer_calls(
+    executions: tuple[TransformerExecutionIR, ...],
+    *,
+    max_seq_len: int,
+) -> PackedDocuments:
+    documents = tuple(document for execution in executions for call in execution.calls for document in call.documents)
+    try:
+        return pack_documents(documents, max_seq_len=max_seq_len)
+    except ValueError as exc:
+        raise CompilationError(f"Could not pack transformer calls: {exc}") from exc

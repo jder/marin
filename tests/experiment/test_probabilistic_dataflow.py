@@ -5,13 +5,26 @@ import numpy as np
 import pytest
 
 from experiments.probabilistic_dataflow.compiler import (
-    AttentionLayout,
+    SCIENTIFIC_POSITION_CHANNEL,
     ConcreteExample,
     TokenCodec,
     inference_plan_ir,
     lower_to_transformer,
 )
 from experiments.probabilistic_dataflow.debug_render import check_example_outputs, render_example_outputs
+from experiments.probabilistic_dataflow.documents import (
+    AttentionLayout,
+    Document,
+    Output,
+    OutputSlot,
+    PredictionState,
+    PredictionUpdateMode,
+    PredictionValue,
+    Record,
+    Supervision,
+    pack_documents,
+    prediction_input_record,
+)
 from experiments.probabilistic_dataflow.dsl import (
     AttentionPattern,
     Budget,
@@ -60,7 +73,7 @@ def test_scalar_tutorial_lowers_to_one_context_and_one_target_record() -> None:
     assert plan.calls[0].attention_layout == AttentionLayout.FULL
     assert plan.calls[0].position_mode == PositionMode.SCIENTIFIC
 
-    sequence = execution.calls[0].sequences[0]
+    sequence = execution.calls[0].documents[0]
     assert sequence.token_ids == (codec.data(3), codec.QUERY_ID)
     assert sequence.target_ids == (-1, codec.data(5))
     assert sequence.loss_weights == (0.0, 1.0)
@@ -89,11 +102,11 @@ def test_document_policy_selects_causal_attention_and_sequence_positions() -> No
         TokenCodec(),
     )
     call = execution.calls[0]
-    sequence = call.sequences[0]
+    sequence = call.documents[0]
 
     assert call.attention_layout == AttentionLayout.CAUSAL
     assert call.position_mode == PositionMode.SEQUENCE
-    assert sequence.scientific_position_ids == (-1, -1)
+    assert sequence.feature_ids(SCIENTIFIC_POSITION_CHANNEL) == (-1, -1)
     assert sequence.rotary_position_ids == (0, 1)
 
 
@@ -141,8 +154,9 @@ def test_parallel_field_lowering_records_approximation_and_target_alignment() ->
     supervised = batch.loss_weights > 0
     assert np.all(batch.token_ids[supervised] == TokenCodec.QUERY_ID)
     assert np.all(batch.target_ids[supervised] >= TokenCodec.DATA_OFFSET)
-    assert np.all(batch.scientific_position_ids[batch.segment_ids >= 0] >= 0)
-    assert {location.example_id.split("-", 1)[0] for location in batch.locations} == {"advection", "contacts"}
+    scientific_positions = batch.feature_ids(SCIENTIFIC_POSITION_CHANNEL)
+    assert np.all(scientific_positions[batch.segment_ids >= 0] >= 0)
+    assert {location.document_id.split("-", 1)[0] for location in batch.locations} == {"advection", "contacts"}
     assert batch.token_ids.shape[0] < len(batch.locations)
 
 
@@ -159,11 +173,13 @@ def test_target_values_are_aligned_labels_and_not_model_inputs() -> None:
     )
     codec = TokenCodec()
 
-    original_sequence = lower_to_transformer(program, original, codec).calls[0].sequences[0]
-    changed_sequence = lower_to_transformer(program, changed, codec).calls[0].sequences[0]
+    original_sequence = lower_to_transformer(program, original, codec).calls[0].documents[0]
+    changed_sequence = lower_to_transformer(program, changed, codec).calls[0].documents[0]
 
     assert original_sequence.token_ids == changed_sequence.token_ids
-    assert original_sequence.scientific_position_ids == changed_sequence.scientific_position_ids
+    assert original_sequence.feature_ids(SCIENTIFIC_POSITION_CHANNEL) == changed_sequence.feature_ids(
+        SCIENTIFIC_POSITION_CHANNEL
+    )
     assert original_sequence.rotary_position_ids == changed_sequence.rotary_position_ids
     assert original_sequence.target_ids != changed_sequence.target_ids
 
@@ -188,6 +204,66 @@ def test_text_and_science_calls_share_vocabulary_with_data_dependent_execution()
     assert text.token_ids.max() < TokenCodec.DATA_OFFSET
     science_values = science.token_ids[(science.segment_ids >= 0) & (science.token_ids != TokenCodec.QUERY_ID)]
     assert science_values.min() >= TokenCodec.DATA_OFFSET
+
+
+def test_one_logical_prediction_assembles_from_documents_with_different_context_views() -> None:
+    slots = tuple(OutputSlot("forecast-0", "future", index) for index in range(4))
+    logical_document = Document(
+        "forecast-0/full",
+        (
+            Record(10, position_id=0),
+            Record(11, position_id=0),
+            *(Record(1, position_id=0, output=Output(slot, Supervision(20 + slot.index))) for slot in slots),
+        ),
+        AttentionLayout.FULL,
+    )
+    left = logical_document.selected("forecast-0/left", (0, 2, 3))
+    right = logical_document.selected("forecast-0/right", (1, 4, 5))
+
+    assert left.token_ids == (10, 1, 1)
+    assert right.token_ids == (11, 1, 1)
+
+    packed = pack_documents((left, right), max_seq_len=6)
+    sampled = np.zeros_like(packed.token_ids)
+    for output in packed.outputs:
+        sampled[output.row, output.position] = 30 + output.slot.index
+    state = PredictionState().updated(
+        packed.prediction_values(sampled),
+        mode=PredictionUpdateMode.REQUIRE_EMPTY,
+    )
+
+    assert tuple(state.value(slot) for slot in slots) == (30, 31, 32, 33)
+
+
+def test_refinement_reads_proposal_state_and_replaces_only_selected_slots() -> None:
+    slots = tuple(OutputSlot("forecast-0", "future", index) for index in range(3))
+    state = PredictionState().updated(
+        tuple(PredictionValue(slot, 10 + slot.index) for slot in slots),
+        mode=PredictionUpdateMode.REQUIRE_EMPTY,
+    )
+    refinement = Document(
+        "forecast-0/refine-1",
+        (
+            prediction_input_record(state, slots[0], position_id=0),
+            prediction_input_record(state, slots[2], position_id=0),
+            Record(1, position_id=0, output=Output(slots[1])),
+        ),
+        AttentionLayout.FULL,
+    )
+
+    assert refinement.token_ids == (10, 12, 1)
+
+    packed = pack_documents((refinement,), max_seq_len=3)
+    sampled = np.zeros_like(packed.token_ids)
+    sampled[packed.outputs[0].row, packed.outputs[0].position] = 99
+    refined = state.updated(
+        packed.prediction_values(sampled),
+        mode=PredictionUpdateMode.REPLACE,
+    )
+
+    assert tuple(refined.value(slot) for slot in slots) == (10, 99, 12)
+    with pytest.raises(ValueError):
+        state.updated(packed.prediction_values(sampled), mode=PredictionUpdateMode.REQUIRE_EMPTY)
 
 
 def test_unordered_pair_program_is_invariant_to_identity_permutation() -> None:

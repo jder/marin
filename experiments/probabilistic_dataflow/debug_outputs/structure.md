@@ -53,58 +53,58 @@ flowchart LR
 
 | Document | Predicted semantic values | Records | Loss positions |
 | --- | --- | --- | --- |
-| 0 | synthetic_structure.contacts[residue={0,1}], synthetic_structure.contacts[residue={0,2}], synthetic_structure.contacts[residue={0,3}], synthetic_structure.contacts[residue={1,2}], synthetic_structure.contacts[residue={1,3}], synthetic_structure.contacts[residue={2,3}] | 10 | 6 |
+| structure-0/call0/doc0 | synthetic_structure.contacts[residue={0,1}], synthetic_structure.contacts[residue={0,2}], synthetic_structure.contacts[residue={0,3}], synthetic_structure.contacts[residue={1,2}], synthetic_structure.contacts[residue={1,3}], synthetic_structure.contacts[residue={2,3}] | 10 | 6 |
 
-### Call 0, document 0
+### Call 0, document `structure-0/call0/doc0`
 
-- Example: `structure-0`
+- Document: `structure-0/call0/doc0`
 - Physical rotary positions: all 0; RoPE is the identity
 - Attention: full_segment within this document's segment; no cross-document attention
 - Serialization: complete records may be permuted; outputs follow the same permutation
 - Loss: 6 aligned target records
 
-| Physical position | Rotary position | Component | Scientific position embedding | Content token | Model treatment | Predicts | Loss |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 0 | context record | synthetic_structure.sequence[residue=0] | 35 value:3 | value token + position policy; no direct loss | - | 0 |
-| 1 | 0 | context record | synthetic_structure.sequence[residue=1] | 34 value:2 | value token + position policy; no direct loss | - | 0 |
-| 2 | 0 | context record | synthetic_structure.sequence[residue=2] | 34 value:2 | value token + position policy; no direct loss | - | 0 |
-| 3 | 0 | context record | synthetic_structure.sequence[residue=3] | 33 value:1 | value token + position policy; no direct loss | - | 0 |
-| 4 | 0 | target record | synthetic_structure.contacts[residue={0,1}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 5 | 0 | target record | synthetic_structure.contacts[residue={0,2}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 6 | 0 | target record | synthetic_structure.contacts[residue={0,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 7 | 0 | target record | synthetic_structure.contacts[residue={1,2}] | 1 <query> | query token + position policy; target value is a label, not an input | value:1 | 1 |
-| 8 | 0 | target record | synthetic_structure.contacts[residue={1,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 9 | 0 | target record | synthetic_structure.contacts[residue={2,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
+| Physical position | Rotary position | Component | Scientific position embedding | Content token | Model treatment | Logical output slot | Predicts | Loss |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0 | context record | synthetic_structure.sequence[residue=0] | 35 value:3 | value token + position policy; no direct loss | - | - | 0 |
+| 1 | 0 | context record | synthetic_structure.sequence[residue=1] | 34 value:2 | value token + position policy; no direct loss | - | - | 0 |
+| 2 | 0 | context record | synthetic_structure.sequence[residue=2] | 34 value:2 | value token + position policy; no direct loss | - | - | 0 |
+| 3 | 0 | context record | synthetic_structure.sequence[residue=3] | 33 value:1 | value token + position policy; no direct loss | - | - | 0 |
+| 4 | 0 | target record | synthetic_structure.contacts[residue={0,1}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/contacts[0] | value:0 | 1 |
+| 5 | 0 | target record | synthetic_structure.contacts[residue={0,2}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/contacts[1] | value:0 | 1 |
+| 6 | 0 | target record | synthetic_structure.contacts[residue={0,3}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/contacts[2] | value:0 | 1 |
+| 7 | 0 | target record | synthetic_structure.contacts[residue={1,2}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/contacts[3] | value:1 | 1 |
+| 8 | 0 | target record | synthetic_structure.contacts[residue={1,3}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/contacts[4] | value:0 | 1 |
+| 9 | 0 | target record | synthetic_structure.contacts[residue={2,3}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/contacts[5] | value:0 | 1 |
 
 ### Call 1 document inventory
 
 | Document | Predicted semantic values | Records | Loss positions |
 | --- | --- | --- | --- |
-| 0 | synthetic_structure.distances[residue={0,1}], synthetic_structure.distances[residue={0,2}], synthetic_structure.distances[residue={0,3}], synthetic_structure.distances[residue={1,2}], synthetic_structure.distances[residue={1,3}], synthetic_structure.distances[residue={2,3}] | 16 | 6 |
+| structure-0/call1/doc0 | synthetic_structure.distances[residue={0,1}], synthetic_structure.distances[residue={0,2}], synthetic_structure.distances[residue={0,3}], synthetic_structure.distances[residue={1,2}], synthetic_structure.distances[residue={1,3}], synthetic_structure.distances[residue={2,3}] | 16 | 6 |
 
-### Call 1, document 0
+### Call 1, document `structure-0/call1/doc0`
 
-- Example: `structure-0`
+- Document: `structure-0/call1/doc0`
 - Physical rotary positions: all 0; RoPE is the identity
 - Attention: full_segment within this document's segment; no cross-document attention
 - Serialization: complete records may be permuted; outputs follow the same permutation
 - Loss: 6 aligned target records
 
-| Physical position | Rotary position | Component | Scientific position embedding | Content token | Model treatment | Predicts | Loss |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 0 | context record | synthetic_structure.sequence[residue=0] | 35 value:3 | value token + position policy; no direct loss | - | 0 |
-| 1 | 0 | context record | synthetic_structure.sequence[residue=1] | 34 value:2 | value token + position policy; no direct loss | - | 0 |
-| 2 | 0 | context record | synthetic_structure.sequence[residue=2] | 34 value:2 | value token + position policy; no direct loss | - | 0 |
-| 3 | 0 | context record | synthetic_structure.sequence[residue=3] | 33 value:1 | value token + position policy; no direct loss | - | 0 |
-| 4 | 0 | context record | synthetic_structure.contacts[residue={0,1}] | 32 value:0 | value token + position policy; no direct loss | - | 0 |
-| 5 | 0 | context record | synthetic_structure.contacts[residue={0,2}] | 32 value:0 | value token + position policy; no direct loss | - | 0 |
-| 6 | 0 | context record | synthetic_structure.contacts[residue={0,3}] | 32 value:0 | value token + position policy; no direct loss | - | 0 |
-| 7 | 0 | context record | synthetic_structure.contacts[residue={1,2}] | 33 value:1 | value token + position policy; no direct loss | - | 0 |
-| 8 | 0 | context record | synthetic_structure.contacts[residue={1,3}] | 32 value:0 | value token + position policy; no direct loss | - | 0 |
-| 9 | 0 | context record | synthetic_structure.contacts[residue={2,3}] | 32 value:0 | value token + position policy; no direct loss | - | 0 |
-| 10 | 0 | target record | synthetic_structure.distances[residue={0,1}] | 1 <query> | query token + position policy; target value is a label, not an input | value:2 | 1 |
-| 11 | 0 | target record | synthetic_structure.distances[residue={0,2}] | 1 <query> | query token + position policy; target value is a label, not an input | value:2 | 1 |
-| 12 | 0 | target record | synthetic_structure.distances[residue={0,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:3 | 1 |
-| 13 | 0 | target record | synthetic_structure.distances[residue={1,2}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 14 | 0 | target record | synthetic_structure.distances[residue={1,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:2 | 1 |
-| 15 | 0 | target record | synthetic_structure.distances[residue={2,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:2 | 1 |
+| Physical position | Rotary position | Component | Scientific position embedding | Content token | Model treatment | Logical output slot | Predicts | Loss |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0 | context record | synthetic_structure.sequence[residue=0] | 35 value:3 | value token + position policy; no direct loss | - | - | 0 |
+| 1 | 0 | context record | synthetic_structure.sequence[residue=1] | 34 value:2 | value token + position policy; no direct loss | - | - | 0 |
+| 2 | 0 | context record | synthetic_structure.sequence[residue=2] | 34 value:2 | value token + position policy; no direct loss | - | - | 0 |
+| 3 | 0 | context record | synthetic_structure.sequence[residue=3] | 33 value:1 | value token + position policy; no direct loss | - | - | 0 |
+| 4 | 0 | context record | synthetic_structure.contacts[residue={0,1}] | 32 value:0 | value token + position policy; no direct loss | - | - | 0 |
+| 5 | 0 | context record | synthetic_structure.contacts[residue={0,2}] | 32 value:0 | value token + position policy; no direct loss | - | - | 0 |
+| 6 | 0 | context record | synthetic_structure.contacts[residue={0,3}] | 32 value:0 | value token + position policy; no direct loss | - | - | 0 |
+| 7 | 0 | context record | synthetic_structure.contacts[residue={1,2}] | 33 value:1 | value token + position policy; no direct loss | - | - | 0 |
+| 8 | 0 | context record | synthetic_structure.contacts[residue={1,3}] | 32 value:0 | value token + position policy; no direct loss | - | - | 0 |
+| 9 | 0 | context record | synthetic_structure.contacts[residue={2,3}] | 32 value:0 | value token + position policy; no direct loss | - | - | 0 |
+| 10 | 0 | target record | synthetic_structure.distances[residue={0,1}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/distances[0] | value:2 | 1 |
+| 11 | 0 | target record | synthetic_structure.distances[residue={0,2}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/distances[1] | value:2 | 1 |
+| 12 | 0 | target record | synthetic_structure.distances[residue={0,3}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/distances[2] | value:3 | 1 |
+| 13 | 0 | target record | synthetic_structure.distances[residue={1,2}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/distances[3] | value:0 | 1 |
+| 14 | 0 | target record | synthetic_structure.distances[residue={1,3}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/distances[4] | value:2 | 1 |
+| 15 | 0 | target record | synthetic_structure.distances[residue={2,3}] | 1 <query> | query token + position policy; target value is a label, not an input | structure-0/distances[5] | value:2 | 1 |

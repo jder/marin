@@ -45,25 +45,25 @@ flowchart LR
 
 | Document | Predicted semantic values | Records | Loss positions |
 | --- | --- | --- | --- |
-| 0 | synthetic_contacts.contacts[residue={0,1}], synthetic_contacts.contacts[residue={0,2}], synthetic_contacts.contacts[residue={0,3}], synthetic_contacts.contacts[residue={1,2}], synthetic_contacts.contacts[residue={1,3}], synthetic_contacts.contacts[residue={2,3}] | 10 | 6 |
+| contacts-0/call0/doc0 | synthetic_contacts.contacts[residue={0,1}], synthetic_contacts.contacts[residue={0,2}], synthetic_contacts.contacts[residue={0,3}], synthetic_contacts.contacts[residue={1,2}], synthetic_contacts.contacts[residue={1,3}], synthetic_contacts.contacts[residue={2,3}] | 10 | 6 |
 
-### Call 0, document 0
+### Call 0, document `contacts-0/call0/doc0`
 
-- Example: `contacts-0`
+- Document: `contacts-0/call0/doc0`
 - Physical rotary positions: all 0; RoPE is the identity
 - Attention: full_segment within this document's segment; no cross-document attention
 - Serialization: complete records may be permuted; outputs follow the same permutation
 - Loss: 6 aligned target records
 
-| Physical position | Rotary position | Component | Scientific position embedding | Content token | Model treatment | Predicts | Loss |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 0 | context record | synthetic_contacts.sequence[residue=0] | 35 value:3 | value token + position policy; no direct loss | - | 0 |
-| 1 | 0 | context record | synthetic_contacts.sequence[residue=1] | 34 value:2 | value token + position policy; no direct loss | - | 0 |
-| 2 | 0 | context record | synthetic_contacts.sequence[residue=2] | 34 value:2 | value token + position policy; no direct loss | - | 0 |
-| 3 | 0 | context record | synthetic_contacts.sequence[residue=3] | 33 value:1 | value token + position policy; no direct loss | - | 0 |
-| 4 | 0 | target record | synthetic_contacts.contacts[residue={0,1}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 5 | 0 | target record | synthetic_contacts.contacts[residue={0,2}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 6 | 0 | target record | synthetic_contacts.contacts[residue={0,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 7 | 0 | target record | synthetic_contacts.contacts[residue={1,2}] | 1 <query> | query token + position policy; target value is a label, not an input | value:1 | 1 |
-| 8 | 0 | target record | synthetic_contacts.contacts[residue={1,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
-| 9 | 0 | target record | synthetic_contacts.contacts[residue={2,3}] | 1 <query> | query token + position policy; target value is a label, not an input | value:0 | 1 |
+| Physical position | Rotary position | Component | Scientific position embedding | Content token | Model treatment | Logical output slot | Predicts | Loss |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0 | context record | synthetic_contacts.sequence[residue=0] | 35 value:3 | value token + position policy; no direct loss | - | - | 0 |
+| 1 | 0 | context record | synthetic_contacts.sequence[residue=1] | 34 value:2 | value token + position policy; no direct loss | - | - | 0 |
+| 2 | 0 | context record | synthetic_contacts.sequence[residue=2] | 34 value:2 | value token + position policy; no direct loss | - | - | 0 |
+| 3 | 0 | context record | synthetic_contacts.sequence[residue=3] | 33 value:1 | value token + position policy; no direct loss | - | - | 0 |
+| 4 | 0 | target record | synthetic_contacts.contacts[residue={0,1}] | 1 <query> | query token + position policy; target value is a label, not an input | contacts-0/contacts[0] | value:0 | 1 |
+| 5 | 0 | target record | synthetic_contacts.contacts[residue={0,2}] | 1 <query> | query token + position policy; target value is a label, not an input | contacts-0/contacts[1] | value:0 | 1 |
+| 6 | 0 | target record | synthetic_contacts.contacts[residue={0,3}] | 1 <query> | query token + position policy; target value is a label, not an input | contacts-0/contacts[2] | value:0 | 1 |
+| 7 | 0 | target record | synthetic_contacts.contacts[residue={1,2}] | 1 <query> | query token + position policy; target value is a label, not an input | contacts-0/contacts[3] | value:1 | 1 |
+| 8 | 0 | target record | synthetic_contacts.contacts[residue={1,3}] | 1 <query> | query token + position policy; target value is a label, not an input | contacts-0/contacts[4] | value:0 | 1 |
+| 9 | 0 | target record | synthetic_contacts.contacts[residue={2,3}] | 1 <query> | query token + position policy; target value is a label, not an input | contacts-0/contacts[5] | value:0 | 1 |

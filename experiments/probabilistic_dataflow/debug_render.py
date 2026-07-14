@@ -8,16 +8,15 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from experiments.probabilistic_dataflow.compiler import (
-    AttentionLayout,
-    ExecutionSequenceIR,
+    SCIENTIFIC_POSITION_CHANNEL,
     InferencePlanIR,
-    PackedBatch,
     TokenCodec,
     TransformerExecutionIR,
     inference_plan_ir,
     lower_to_transformer,
     pack_transformer_calls,
 )
+from experiments.probabilistic_dataflow.documents import AttentionLayout, Document, PackedDocuments
 from experiments.probabilistic_dataflow.dsl import Axis, FieldType, FlowInfo, InferenceProgram, PositionMode
 from experiments.probabilistic_dataflow.synthetic import (
     advection_example,
@@ -138,13 +137,13 @@ def render_execution_ir(
 ) -> str:
     call_rows = []
     for call in execution.calls:
-        supervised_tokens = sum(int(sum(sequence.loss_weights)) for sequence in call.sequences)
+        supervised_tokens = sum(int(sum(document.loss_weights)) for document in call.documents)
         call_rows.append(
             (
                 str(call.call_id),
                 call.operator,
                 ", ".join(str(value) for value in call.dependency_call_ids) or "-",
-                str(len(call.sequences)),
+                str(len(call.documents)),
                 str(supervised_tokens),
                 call.attention_layout,
                 call.position_mode,
@@ -167,10 +166,10 @@ def render_execution_ir(
     ]
     for call in execution.calls:
         inventory = []
-        for sequence in call.sequences:
+        for sequence in call.documents:
             inventory.append(
                 (
-                    str(sequence.sequence_id),
+                    sequence.id,
                     ", ".join(_predicted_semantics(sequence, codec)),
                     str(len(sequence.token_ids)),
                     str(int(sum(sequence.loss_weights))),
@@ -182,21 +181,21 @@ def render_execution_ir(
                 _markdown_table(("Document", "Predicted semantic values", "Records", "Loss positions"), inventory),
             )
         )
-        for sequence in call.sequences[:detailed_documents_per_call]:
+        for sequence in call.documents[:detailed_documents_per_call]:
             parts.extend(
                 (
-                    f"### Call {call.call_id}, document {sequence.sequence_id}",
+                    f"### Call {call.call_id}, document `{sequence.id}`",
                     _render_document(sequence, codec, call.attention_layout, call.position_mode),
                 )
             )
-        omitted = len(call.sequences) - detailed_documents_per_call
+        omitted = len(call.documents) - detailed_documents_per_call
         if omitted > 0:
             parts.append(f"{omitted} additional documents omitted.")
     return "\n\n".join(parts)
 
 
 def render_packed_batch(
-    batch: PackedBatch,
+    batch: PackedDocuments,
     codec: TokenCodec,
     *,
     heading: str = "## Packed heterogeneous batch",
@@ -207,6 +206,7 @@ def render_packed_batch(
         (
             ("shape", f"{batch.token_ids.shape[0]} rows x {batch.token_ids.shape[1]} tokens"),
             ("documents", str(len(batch.locations))),
+            ("logical outputs", str(len(batch.outputs))),
             ("supervised tokens", str(int(batch.loss_weights.sum()))),
             ("rotary positions", "all 0; RoPE is the identity"),
             ("attention", f"{batch.attention_layout} within each segment"),
@@ -225,10 +225,7 @@ def render_packed_batch(
         for segment_id, start, end in _segment_spans(batch.segment_ids[row_index]):
             location = location_by_span[(row_index, start, end)]
             losses = int(batch.loss_weights[row_index, start:end].sum())
-            spans.append(
-                f"seg={segment_id} {start}:{end} {location.example_id}/call{location.call_id}/doc{location.sequence_id} "
-                f"losses={losses}"
-            )
+            spans.append(f"seg={segment_id} {start}:{end} {location.document_id} losses={losses}")
         first_records = ", ".join(
             _packed_record_label(batch, codec, row_index, position)
             for position in range(min(8, batch.token_ids.shape[1]))
@@ -484,7 +481,7 @@ def _render_task_records(batch: TaskBatch, codec: TokenCodec, *, row: int, max_r
 
 
 def _render_document(
-    sequence: ExecutionSequenceIR,
+    sequence: Document,
     codec: TokenCodec,
     attention_layout: AttentionLayout,
     position_mode: PositionMode,
@@ -498,7 +495,7 @@ def _render_document(
         else "physical record order participates in model semantics"
     )
     metadata = (
-        f"- Example: `{sequence.example_id}`\n"
+        f"- Document: `{sequence.id}`\n"
         f"- Physical rotary positions: {rotary_treatment}\n"
         f"- Attention: {attention_layout} within this document's segment; no cross-document attention\n"
         f"- Serialization: {serialization}\n"
@@ -506,7 +503,7 @@ def _render_document(
     )
     rows = []
     for position, (token_id, scientific_position_id) in enumerate(
-        zip(sequence.token_ids, sequence.scientific_position_ids, strict=True)
+        zip(sequence.token_ids, sequence.feature_ids(SCIENTIFIC_POSITION_CHANNEL), strict=True)
     ):
         target_id = sequence.target_ids[position]
         scientific_position = (
@@ -520,6 +517,10 @@ def _render_document(
             component = "context record"
             treatment = "value token + position policy; no direct loss"
             target = "-"
+        output_slot = sequence.output_slots[position]
+        logical_output = "-"
+        if output_slot is not None:
+            logical_output = f"{output_slot.example_id}/{output_slot.value_name}[{output_slot.index}]"
         rows.append(
             (
                 str(position),
@@ -528,6 +529,7 @@ def _render_document(
                 scientific_position,
                 f"{token_id} {codec.token_label(token_id)}",
                 treatment,
+                logical_output,
                 target,
                 f"{sequence.loss_weights[position]:g}",
             )
@@ -540,6 +542,7 @@ def _render_document(
             "Scientific position embedding",
             "Content token",
             "Model treatment",
+            "Logical output slot",
             "Predicts",
             "Loss",
         ),
@@ -548,11 +551,11 @@ def _render_document(
     return "\n\n".join((metadata, table))
 
 
-def _predicted_semantics(sequence: ExecutionSequenceIR, codec: TokenCodec) -> tuple[str, ...]:
+def _predicted_semantics(sequence: Document, codec: TokenCodec) -> tuple[str, ...]:
     return tuple(
         codec.scientific_position_name(scientific_position_id)
         for scientific_position_id, target_id in zip(
-            sequence.scientific_position_ids,
+            sequence.feature_ids(SCIENTIFIC_POSITION_CHANNEL),
             sequence.target_ids,
             strict=True,
         )
@@ -560,8 +563,8 @@ def _predicted_semantics(sequence: ExecutionSequenceIR, codec: TokenCodec) -> tu
     )
 
 
-def _packed_record_label(batch: PackedBatch, codec: TokenCodec, row: int, position: int) -> str:
-    scientific_position_id = int(batch.scientific_position_ids[row, position])
+def _packed_record_label(batch: PackedDocuments, codec: TokenCodec, row: int, position: int) -> str:
+    scientific_position_id = int(batch.feature_ids(SCIENTIFIC_POSITION_CHANNEL)[row, position])
     if scientific_position_id < 0:
         return "<pad>"
     scientific_position = codec.scientific_position_name(scientific_position_id)
