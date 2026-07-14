@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import ClassVar
 
 import equinox as eqx
 import jax
@@ -14,36 +15,63 @@ from levanter.grug.attention import AttentionMask
 from levanter.grug.sharding import compact_grug_mesh
 
 from experiments.grug.base.model import GrugModelConfig
-from experiments.probabilistic_dataflow.compiler import (
-    SCIENTIFIC_POSITION_CHANNEL,
-    TokenCodec,
-    lower_to_transformer,
-    pack_transformer_calls,
-)
 from experiments.probabilistic_dataflow.documents import (
     AttentionLayout,
+    Document,
+    FeatureId,
+    Output,
+    OutputSlot,
     PackedDocuments,
+    Record,
+    Supervision,
     causal_training_document,
     pack_documents,
 )
 from experiments.probabilistic_dataflow.scientific_model import CrossDomainTransformer
-from experiments.probabilistic_dataflow.synthetic import (
-    advection_example,
-    advection_program,
-    contacts_example,
-    contacts_program,
+
+SCIENTIFIC_POSITION_CHANNEL = "scientific_position"
+ADVECTION_CELLS = 4
+ADVECTION_STEPS = 3
+ADVECTION_CONTEXT_RECORDS = ADVECTION_CELLS + ADVECTION_CELLS * ADVECTION_STEPS
+ADVECTION_OUTPUT_RECORDS = ADVECTION_CELLS * ADVECTION_STEPS
+ADVECTION_RECORDS = ADVECTION_CONTEXT_RECORDS + ADVECTION_OUTPUT_RECORDS
+
+TEXT_SENTENCES = (
+    ("bos", "the", "ocean", "field", "changes", "slowly", "eos"),
+    ("bos", "the", "protein", "contact", "changes", "slowly", "eos"),
+    ("bos", "the", "ocean", "contact", "changes", "today", "eos"),
+    ("bos", "the", "protein", "field", "changes", "today", "eos"),
 )
 
 
-@dataclass(frozen=True)
-class TrainingResult:
-    initial_loss: float
-    final_loss: float
-    initial_accuracy: float
-    final_accuracy: float
-    supervised_tokens: int
-    packed_rows: int
-    task_families: tuple[str, ...]
+@dataclass
+class SyntheticTokenCodec:
+    """Small shared vocabulary for the direct document training smoke."""
+
+    _tokens: dict[str, int] = field(default_factory=dict)
+
+    PAD_ID: ClassVar[int] = 0
+    QUERY_ID: ClassVar[int] = 1
+    TOKEN_OFFSET: ClassVar[int] = 2
+    DATA_OFFSET: ClassVar[int] = 32
+    DATA_BINS: ClassVar[int] = 32
+
+    @property
+    def vocab_size(self) -> int:
+        return self.DATA_OFFSET + self.DATA_BINS
+
+    def token(self, name: str) -> int:
+        if name not in self._tokens:
+            token_id = self.TOKEN_OFFSET + len(self._tokens)
+            if token_id >= self.DATA_OFFSET:
+                raise ValueError("Synthetic text vocabulary overlaps scientific value tokens")
+            self._tokens[name] = token_id
+        return self._tokens[name]
+
+    def data(self, value: int) -> int:
+        if value < 0 or value >= self.DATA_BINS:
+            raise ValueError(f"Synthetic value {value} is outside [0, {self.DATA_BINS})")
+        return self.DATA_OFFSET + value
 
 
 @dataclass(frozen=True)
@@ -99,29 +127,53 @@ class CrossDomainTrainingResult:
     shared_vocab_size: int
 
 
-TEXT_SENTENCES = (
-    ("bos", "the", "ocean", "field", "changes", "slowly", "eos"),
-    ("bos", "the", "protein", "contact", "changes", "slowly", "eos"),
-    ("bos", "the", "ocean", "contact", "changes", "today", "eos"),
-    ("bos", "the", "protein", "field", "changes", "today", "eos"),
-)
+def synthetic_advection_document(codec: SyntheticTokenCodec, *, seed: int) -> Document:
+    """Build one labeled advection call directly from document primitives."""
+    rng = np.random.default_rng(seed)
+    initial = rng.integers(0, 16, size=ADVECTION_CELLS, dtype=np.int32)
+    forcing = rng.integers(0, 4, size=(ADVECTION_STEPS, ADVECTION_CELLS), dtype=np.int32)
+    future_steps = []
+    current = initial
+    for step_forcing in forcing:
+        current = (np.roll(current, 1) + step_forcing) % 16
+        future_steps.append(current)
+    future = np.stack(future_steps)
+
+    example_id = f"advection-{seed}"
+    records = []
+    position = 0
+    for value in (*initial, *forcing.flat):
+        records.append(
+            Record(
+                codec.data(int(value)),
+                position_id=0,
+                features=(FeatureId(SCIENTIFIC_POSITION_CHANNEL, position),),
+            )
+        )
+        position += 1
+    for index, value in enumerate(future.flat):
+        records.append(
+            Record(
+                codec.QUERY_ID,
+                position_id=0,
+                features=(FeatureId(SCIENTIFIC_POSITION_CHANNEL, position),),
+                output=Output(
+                    OutputSlot(example_id, "future", index),
+                    Supervision(codec.data(int(value))),
+                ),
+            )
+        )
+        position += 1
+    assert position == ADVECTION_RECORDS
+    return Document(example_id, tuple(records), AttentionLayout.FULL)
 
 
 def record_order_equivariance_error(*, seed: int = 0) -> float:
     """Measure the maximum logit change after permuting and restoring scientific records."""
-    program = advection_program()
-    codec = TokenCodec()
-    sequence = (
-        lower_to_transformer(
-            program,
-            advection_example(program, seed=seed),
-            codec,
-        )
-        .calls[0]
-        .documents[0]
-    )
-    order = tuple(int(index) for index in np.random.default_rng(seed).permutation(len(sequence.token_ids)))
-    permuted = sequence.reordered(order)
+    codec = SyntheticTokenCodec()
+    document = synthetic_advection_document(codec, seed=seed)
+    order = tuple(int(index) for index in np.random.default_rng(seed).permutation(len(document.records)))
+    permuted = document.reordered(order)
     config = GrugModelConfig(
         vocab_size=codec.vocab_size,
         hidden_dim=16,
@@ -129,21 +181,21 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
         num_layers=2,
         num_heads=4,
         num_kv_heads=2,
-        max_seq_len=len(sequence.token_ids),
+        max_seq_len=len(document.records),
     )
     with jax.set_mesh(compact_grug_mesh()):
         model = CrossDomainTransformer.init(
             config,
-            scientific_position_count=codec.scientific_position_count,
+            scientific_position_count=ADVECTION_RECORDS,
             key=jax.random.PRNGKey(seed),
         )
-        segment_ids = jnp.zeros((1, len(sequence.token_ids)), dtype=jnp.int32)
+        segment_ids = jnp.zeros((1, len(document.records)), dtype=jnp.int32)
         mask = AttentionMask().with_segment_ids(segment_ids)
         logits = model.logits(
-            jnp.asarray((sequence.token_ids,)),
-            jnp.asarray((sequence.feature_ids(SCIENTIFIC_POSITION_CHANNEL),)),
+            jnp.asarray((document.token_ids,)),
+            jnp.asarray((document.feature_ids(SCIENTIFIC_POSITION_CHANNEL),)),
             mask=mask,
-            rotary_position_ids=jnp.asarray((sequence.rotary_position_ids,)),
+            rotary_position_ids=jnp.asarray((document.rotary_position_ids,)),
         )
         permuted_logits = model.logits(
             jnp.asarray((permuted.token_ids,)),
@@ -156,35 +208,7 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
     return float(np.max(np.abs(np.asarray(logits) - restored_logits)))
 
 
-def build_mixed_synthetic_batch(
-    *, examples_per_problem: int = 8, max_seq_len: int = 64
-) -> tuple[PackedDocuments, TokenCodec]:
-    if examples_per_problem <= 0:
-        raise ValueError(f"examples_per_problem must be positive, got {examples_per_problem}")
-    codec = TokenCodec()
-    advection = advection_program()
-    contacts = contacts_program()
-
-    executions = []
-    for seed in range(examples_per_problem):
-        executions.append(
-            lower_to_transformer(
-                advection,
-                advection_example(advection, seed=seed),
-                codec,
-            )
-        )
-        executions.append(
-            lower_to_transformer(
-                contacts,
-                contacts_example(contacts, seed=10_000 + seed),
-                codec,
-            )
-        )
-    return pack_transformer_calls(tuple(executions), max_seq_len=max_seq_len), codec
-
-
-def build_synthetic_text_batch(codec: TokenCodec, *, repetitions: int = 4) -> TaskBatch:
+def build_synthetic_text_batch(codec: SyntheticTokenCodec, *, repetitions: int = 4) -> TaskBatch:
     """Build a small causal next-token workload in the shared token vocabulary."""
     if repetitions <= 0:
         raise ValueError(f"repetitions must be positive, got {repetitions}")
@@ -201,117 +225,16 @@ def build_synthetic_text_batch(codec: TokenCodec, *, repetitions: int = 4) -> Ta
 
 
 def build_synthetic_advection_batch(
-    codec: TokenCodec,
+    codec: SyntheticTokenCodec,
     *,
     examples: int = 8,
     max_seq_len: int = 64,
 ) -> TaskBatch:
-    """Build a full-attention scientific workload in the shared token vocabulary."""
+    """Build a batch of full-attention scientific documents."""
     if examples <= 0:
         raise ValueError(f"examples must be positive, got {examples}")
-    program = advection_program()
-    executions = tuple(
-        lower_to_transformer(
-            program,
-            advection_example(program, seed=seed),
-            codec,
-        )
-        for seed in range(examples)
-    )
-    packed = pack_transformer_calls(executions, max_seq_len=max_seq_len)
-    return TaskBatch("synthetic_advection", packed)
-
-
-def train_smoke(
-    *,
-    steps: int = 80,
-    examples_per_problem: int = 8,
-    max_seq_len: int = 64,
-    seed: int = 0,
-) -> TrainingResult:
-    """Train a tiny Marin Grug transformer on permutation-equivariant scientific records."""
-    if steps <= 0:
-        raise ValueError(f"steps must be positive, got {steps}")
-    batch, codec = build_mixed_synthetic_batch(
-        examples_per_problem=examples_per_problem,
-        max_seq_len=max_seq_len,
-    )
-    mesh = compact_grug_mesh()
-    model_config = GrugModelConfig(
-        vocab_size=codec.vocab_size,
-        hidden_dim=48,
-        intermediate_dim=96,
-        num_layers=2,
-        num_heads=4,
-        num_kv_heads=2,
-        max_seq_len=max_seq_len,
-    )
-    optimizer = optax.adam(learning_rate=3e-3)
-
-    with jax.set_mesh(mesh):
-        model = CrossDomainTransformer.init(
-            model_config,
-            scientific_position_count=codec.scientific_position_count,
-            key=jax.random.PRNGKey(seed),
-        )
-        opt_state = optimizer.init(model)
-        token_ids = jnp.asarray(batch.token_ids)
-        scientific_position_ids = jnp.asarray(batch.feature_ids(SCIENTIFIC_POSITION_CHANNEL))
-        rotary_position_ids = jnp.asarray(batch.rotary_position_ids)
-        target_ids = jnp.asarray(batch.target_ids)
-        loss_weights = jnp.asarray(batch.loss_weights)
-        segment_ids = jnp.asarray(batch.segment_ids)
-
-        initial_loss, initial_accuracy = _metrics(
-            model,
-            token_ids,
-            scientific_position_ids,
-            rotary_position_ids,
-            target_ids,
-            loss_weights,
-            segment_ids,
-        )
-
-        @eqx.filter_jit
-        def train_step(current_model: CrossDomainTransformer, current_opt_state: optax.OptState):
-            def loss_fn(candidate: CrossDomainTransformer):
-                mask = AttentionMask().with_segment_ids(segment_ids)
-                return candidate.aligned_token_loss(
-                    token_ids,
-                    scientific_position_ids,
-                    target_ids,
-                    loss_weights,
-                    mask=mask,
-                    rotary_position_ids=rotary_position_ids,
-                    reduction="mean",
-                )
-
-            loss, grads = eqx.filter_value_and_grad(loss_fn)(current_model)
-            updates, next_opt_state = optimizer.update(grads, current_opt_state, current_model)
-            next_model = eqx.apply_updates(current_model, updates)
-            return next_model, next_opt_state, loss
-
-        for _ in range(steps):
-            model, opt_state, _ = train_step(model, opt_state)
-        final_loss, final_accuracy = _metrics(
-            model,
-            token_ids,
-            scientific_position_ids,
-            rotary_position_ids,
-            target_ids,
-            loss_weights,
-            segment_ids,
-        )
-
-    return TrainingResult(
-        initial_loss=float(initial_loss),
-        final_loss=float(final_loss),
-        initial_accuracy=float(initial_accuracy),
-        final_accuracy=float(final_accuracy),
-        supervised_tokens=int(np.sum(batch.loss_weights)),
-        packed_rows=batch.token_ids.shape[0],
-        task_families=("synthetic_advection", "synthetic_contacts"),
-    )
+    documents = tuple(synthetic_advection_document(codec, seed=seed) for seed in range(examples))
+    return TaskBatch("synthetic_advection", pack_documents(documents, max_seq_len=max_seq_len))
 
 
 def train_cross_domain_smoke(
@@ -324,7 +247,7 @@ def train_cross_domain_smoke(
     """Train one Grug parameter set on causal text and full-attention scientific calls."""
     if steps <= 0:
         raise ValueError(f"steps must be positive, got {steps}")
-    codec = TokenCodec()
+    codec = SyntheticTokenCodec()
     text_batch = build_synthetic_text_batch(codec, repetitions=max(1, examples_per_task // len(TEXT_SENTENCES)))
     science_batch = build_synthetic_advection_batch(
         codec,
@@ -349,7 +272,7 @@ def train_cross_domain_smoke(
     with jax.set_mesh(compact_grug_mesh()):
         model = CrossDomainTransformer.init(
             model_config,
-            scientific_position_count=codec.scientific_position_count,
+            scientific_position_count=ADVECTION_RECORDS,
             key=jax.random.PRNGKey(seed),
         )
         opt_state = optimizer.init(model)
@@ -395,27 +318,6 @@ def train_cross_domain_smoke(
         science=science_metrics,
         task_families=(text_batch.name, science_batch.name),
         shared_vocab_size=codec.vocab_size,
-    )
-
-
-def _metrics(
-    model: CrossDomainTransformer,
-    token_ids: jax.Array,
-    scientific_position_ids: jax.Array,
-    rotary_position_ids: jax.Array,
-    target_ids: jax.Array,
-    loss_weights: jax.Array,
-    segment_ids: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    mask = AttentionMask().with_segment_ids(segment_ids)
-    return _aligned_metrics(
-        model,
-        token_ids,
-        scientific_position_ids,
-        rotary_position_ids,
-        target_ids,
-        loss_weights,
-        mask=mask,
     )
 
 

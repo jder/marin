@@ -1,62 +1,52 @@
-# Probabilistic scientific dataflow spike
+# Probabilistic scientific document programs
 
-This experiment tests a small document library for building heterogeneous
-transformer calls without introducing a new model stack or dataset system.
-The reusable surface has three layers:
+This experiment tests a small library for expressing transformer inputs and
+adaptive model-call sequences. The public concepts are:
 
-- `Record`, `Document`, and `OutputSlot` encode model inputs and logical outputs;
-- Python generators yield barriered `DocumentRequest` waves and receive
-  per-document prediction observations;
-- executor adapters pack ready documents and route results back to the generator.
+- `Record`, `Document`, and `OutputSlot` for model inputs and logical outputs;
+- Python generators that yield barriered `DocumentRequest` waves;
+- executor adapters that batch documents and route `DocumentResult` values back
+  to the suspended generators.
 
-Control flow stays in Python. A program can branch, loop, split one prediction
-over several context views, or feed sampled values into a later document. An
-executor does not understand refinement, domain values, or call topology.
+Domain control flow stays in Python. The driver does not contain refinement
+operators, graph nodes, strategy registries, or scientific value types.
 
-The scientist-facing `InferenceProgram` remains one optional static encoder
-into the document library. It is useful when a complete plan must be inspected
-before execution, but packing and interactive execution do not depend on it.
+Start with [`TUTORIAL.md`](TUTORIAL.md) for an executable path from a two-record
+scalar prediction through overlapping context windows, adaptive refinement,
+subprogram composition, and shared text-and-science training.
 
-Start with [`TUTORIAL.md`](TUTORIAL.md) for a guided path from a two-record
-scalar prediction through generator execution, overlapping context windows,
-adaptive refinement, subprogram composition, and shared text-and-science
-training.
+## Documents
 
-## Document library boundary
-
-The reusable execution boundary consists of immutable `Record`, `Document`,
-`OutputSlot`, `PackedDocuments`, and `PredictionState` values. An output slot
-identifies a logical value independently of the document that predicts it:
+An immutable `Document` is one attention domain. Each `Record` carries an input
+token, a rotary position, categorical feature IDs, and an optional `Output`:
 
 ```python
 slot = OutputSlot("advection-0", "future", index=7)
 query = Record(
-    input_id=codec.QUERY_ID,
+    input_id=QUERY_ID,
     position_id=0,
-    output=Output(slot, Supervision(codec.data(true_value))),
+    features=(FeatureId("scientific_position", 7),),
+    output=Output(slot, Supervision(target_id)),
 )
 document = Document("advection-0/window-1", records, AttentionLayout.FULL)
 ```
 
-Several documents can write disjoint subsets of the same logical slot set.
-Each document may carry a different context view, which permits context-window
-sharding without changing the identity of the requested values. Packing keeps
-the output-slot locations alongside the dense arrays, and sampled values merge
-into one immutable state.
+`OutputSlot` identifies the requested value independently of the document that
+predicts it. Several documents may request disjoint subsets of one field or
+produce competing observations for the same slot. Document IDs are descriptive
+and may repeat; result routing uses document occurrence order.
 
-Refinement writes the same slots again with an explicit replacement policy.
-Feedback records are materialized from `PredictionState`, so inference code
-feeds the preceding proposal back into the next document rather than silently
-using a training label. Multiple hypotheses are represented by multiple states;
-the document library does not choose how competing predictions are combined.
+`Supervision` is label metadata. The target token is absent from
+`Document.token_ids`. Inference uses the same query record with
+`Output(slot)` and no label.
 
-Causal text uses the same representation: the record containing token `i`
-writes the logical slot for token `i + 1`. Scientific query records instead
-write aligned field-value slots. Both paths use `pack_documents`.
+`pack_documents` creates dense token, feature, rotary-position, target, loss,
+and segment arrays while retaining each output's logical slot and physical
+location. Documents in one packed batch share an `AttentionLayout`.
 
-## Interactive document programs
+## Programs
 
-A document source is an ordinary two-way generator:
+A `DocumentProgram[T]` is a normal Python generator:
 
 ```python
 def forecast_program(document):
@@ -72,169 +62,95 @@ def forecast_program(document):
     )
 ```
 
-Each yielded request is one barrier: all its documents may execute in parallel,
-and the generator resumes only after every document result is available.
-`run_programs` mixes the ready requests from independent programs. Sequential
-subprograms compose with `yield from`; `parallel_programs` is the one small
-combinator needed to expose ready waves from adaptive children together.
+Each yielded request is one barrier. Its documents may execute in parallel, and
+the generator resumes after every result is available. `run_programs` mixes the
+ready requests from independent programs. Sequential subprograms use
+`yield from`; `parallel_programs` exposes ready waves from adaptive children
+together.
 
-Responses preserve document occurrences before observations are combined.
-`results[i]` belongs to `request.documents[i]`; document IDs are descriptive
-and may repeat. This permits overlapping context windows to predict the same
-slot several times. The program must then choose a policy, such as the highest
-log-probability observation, before committing values to `PredictionState`.
-Each result also records whether its values were sampled, supervised, or
-corrupted, and the request declares which origins it accepts.
+Responses retain individual `PredictionObservation` values until the program
+chooses a combination policy. `disjoint_prediction_observations` rejects
+overlap. `highest_logprob_observations` selects one candidate per slot.
+`PredictionState` then commits selected tokens with explicit insert or replace
+semantics.
 
-Three mock domains exercise the boundary:
+Each `DocumentResult` records whether its observations are sampled, supervised,
+or corrupted. A request declares which origins it accepts, so labels cannot
+silently become inference feedback.
+
+The driver records yield-boundary exchanges for replay. A fresh generator can
+consume the transcript and fail at the first changed request. The live generator
+frame and transcript are not durable checkpoints.
+
+## Executors
+
+`mapped_executor` adapts a per-document prediction function for local examples
+and tests. `packed_executor`:
+
+1. collects documents from every ready request;
+2. groups them by attention layout;
+3. packs each group;
+4. invokes a batch prediction function;
+5. reconstructs results by request and document occurrence.
+
+Packing carries an explicit document index, so repeated document IDs and
+overlapping output slots do not affect routing.
+
+## Mock domains
 
 - [`mock_refinement.py`](mock_refinement.py) performs adaptive partial
-  refinement with unlabeled inference documents and an explicit labeled variant;
-- [`mock_windowed.py`](mock_windowed.py) assembles overlapping context windows
-  and feeds the selected predictions into a continuation document;
+  refinement. Inference construction requires only output shape; a separate
+  constructor attaches training labels.
+- [`mock_windowed.py`](mock_windowed.py) combines overlapping context windows
+  and feeds selected predictions into a continuation document.
 - [`mock_composition.py`](mock_composition.py) uses sequential and parallel
-  subprograms for planning, unequal specialist workloads, verification, and retry.
+  subprograms for planning, unequal specialist workloads, verification, retry,
+  and cleanup on failure.
 
-The driver records yield-boundary exchanges for deterministic replay. A fresh
-generator can consume that transcript and fail at the first changed request;
-the live generator frame is not a serialized plan or checkpoint.
+## Shared Grug training smoke
 
-## Scientist-facing surface
-
-```python
-document = DocumentSpec(
-    attention=AttentionPattern.FULL,
-    positions=PositionMode.SCIENTIFIC,
-)
-program = InferenceProgram(
-    "advection",
-    budget=Budget(model_calls=1, generated_tokens=12),
-)
-
-initial = program.input_value("initial", state)
-forcing = program.input_value("forcing", forcing_type)
-future = program.generate(
-    "future",
-    trajectory,
-    context=(initial, forcing),
-    document=document,
-    factor_name="advection_transition",
-)
-program.finish(future)
-```
-
-The logical values contain no physical token order. Compilation creates one
-record per scientific value instance:
-
-```text
-record embedding = content token embedding + scientific position embedding
-```
-
-Context records carry value tokens. Target records carry a `<query>` token and
-an aligned training label; the target value is not a model input. Scientific
-documents use zero rotary positions and full attention when those choices match
-the scientific factor. Reordering complete records therefore only reorders the
-outputs.
-
-Sequential factorization is represented by generated values flowing between
-model calls. For example:
-
-```python
-contacts = program.generate("contacts", contacts_type, context=(sequence,), ...)
-distances = program.generate("distances", distance_type, context=(sequence, contacts), ...)
-```
-
-The second call depends on the first because `contacts` is generated context.
-A causal mask is used only when the task itself requires sequence order.
-
-## Shared text-and-science model
-
-The model remains a normal dense Grug transformer with RoPE. Execution data
-selects the behavior for each call:
+[`training.py`](training.py) constructs causal text and full-attention advection
+documents directly from the document primitives. Both tasks use one dense Grug
+parameter set, token embedding table, transformer stack, and output projection.
 
 | Task | Position signal | Attention | Target alignment |
 | --- | --- | --- | --- |
-| Synthetic text | rotary token index `0..S-1` | causal | next token |
-| Scientific records | scientific descriptor; rotary position `0` | full within segment | same record |
+| Synthetic text | rotary index `0..S-1` | causal | next token |
+| Synthetic advection | scientific feature; rotary position `0` | full per segment | same record |
 
-Both paths use the same token embeddings, transformer blocks, and output
-projection. Calls with different attention layouts are evaluated in separate
-dense batches, but their losses update the same model parameters.
-
-The scientific smoke test packs synthetic advection and contact-map examples.
-A second smoke test mixes causal synthetic text with full-attention scientific
-records. These are compatibility and memorization checks, not scientific
-generalization or language-quality results.
+The 80-step CPU smoke reduced combined training loss from `4.1909` to `0.2022`.
+This is a compatibility and memorization result. It does not measure held-out
+scientific prediction, language quality, cross-task transfer, or refinement
+quality.
 
 ## Run
 
-Inspect compiler behavior without training:
+Run the document and generator behavior tests:
 
 ```bash
-uv run python -m experiments.probabilistic_dataflow.demo --training-steps 0
+uv run pytest -q \
+  tests/experiment/test_document_programs.py \
+  tests/experiment/test_mock_refinement_program.py \
+  tests/experiment/test_mock_windowed_program.py \
+  tests/experiment/test_mock_composition_program.py \
+  tests/experiment/test_probabilistic_dataflow.py -m 'not slow'
 ```
 
-Run the tiny training demonstrations:
+Run the two-layer Grug training smoke:
 
 ```bash
-uv run python -m experiments.probabilistic_dataflow.demo --training-steps 80
+uv run pytest -q tests/experiment/test_probabilistic_dataflow.py -m slow
 ```
-
-## Debug renderings
-
-Generate readable Markdown for the staged values, model-call plan, transformer
-execution, and document layout:
-
-```bash
-uv run python -m experiments.probabilistic_dataflow.debug_render
-```
-
-The reports live in [`debug_outputs/`](debug_outputs/README.md):
-
-- [`scalar.md`](debug_outputs/scalar.md) shows one context scalar and one target;
-- [`advection.md`](debug_outputs/advection.md) shows an indexed field and refinement calls;
-- [`contacts.md`](debug_outputs/contacts.md) shows unordered residue-pair targets;
-- [`structure.md`](debug_outputs/structure.md) shows `sequence -> contacts -> distances`;
-- [`mixed-packing.md`](debug_outputs/mixed-packing.md) shows packed segment boundaries;
-- [`cross-domain.md`](debug_outputs/cross-domain.md) compares text and science calls through one model.
-
-Verify that checked-in reports match the renderer:
-
-```bash
-uv run python -m experiments.probabilistic_dataflow.debug_render --check
-```
-
-## Implemented
-
-- ordered, set, mesh, categorical, and unordered-pair axes;
-- typed discrete fields and canonical pair coordinates;
-- external inputs, deterministic map/join/select/reduce nodes, and generated values;
-- provenance, split-key, and random-ancestor propagation;
-- a staged model-call DAG with full or causal attention and scientific or sequence positions;
-- stable logical output slots spanning multiple documents and context views;
-- immutable prediction state with explicit initial-write and refinement-replacement policies;
-- interactive generator programs with barriered multi-document requests;
-- mixed execution of independent programs and parallel adaptive subprograms;
-- per-document feedback provenance and explicit observation-selection policies;
-- yield-boundary transcript replay with divergence detection;
-- parallel generation and fixed-step refinement;
-- factor-dependency preservation and explicit parallel-marginal approximation notes;
-- inference-plan and transformer-execution IRs;
-- shared value-token embeddings plus scientific position embeddings;
-- aligned scientific labels, shifted text labels, and standard cross-entropy for both;
-- heterogeneous scientific packing with per-document segment boundaries;
-- a numerical scientific-record permutation-equivariance check;
-- field RMSE and spectral-error metrics;
-- tiny scientific-only and cross-domain Marin Grug training loops.
 
 ## Deliberate limits
 
-- Values are already discretized synthetic integers, and text uses a tiny fixed vocabulary.
-- An LM generating these Python inference programs is the intended workflow, but is not implemented here.
-- Parallel field generation is a product-of-token-marginals approximation, recorded in the plan.
-- Prediction-state assembly and replacement are implemented; model sampling is supplied through executor adapters.
-- Scientific positions use one learned embedding per fully qualified coordinate; compositional axis and topology encoders are not implemented.
-- Calls with different attention layouts are not packed into the same dense batch.
-- The mock refinement loop has adaptive stopping, but learned stopping policies and refinement-quality experiments are out of scope.
-- Transcripts currently retain requests and responses in memory and are not a durable checkpoint format.
-- KV-cache execution, datasets, simulators, and external effects are out of scope.
+- Scientific and text values use small synthetic vocabularies.
+- The scientific position adapter learns one embedding per record identity;
+  compositional axis and topology encoders are not implemented.
+- Calls with different attention layouts use separate dense batches.
+- The refinement examples use hand-written confidence rules. Learned stopping
+  policies and refinement-quality experiments are untested.
+- Transcripts retain requests and responses in memory and are not a durable
+  checkpoint format.
+- KV-cache execution, production sampling, datasets, simulators, and external
+  effects are out of scope.
