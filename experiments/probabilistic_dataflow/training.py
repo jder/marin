@@ -18,14 +18,10 @@ from experiments.grug.base.model import GrugModelConfig
 from experiments.probabilistic_dataflow.documents import (
     AttentionLayout,
     Document,
-    FeatureId,
-    Output,
-    OutputSlot,
-    PackedDocuments,
-    Record,
-    Supervision,
+    PackedBatch,
+    Token,
     causal_training_document,
-    pack_documents,
+    pack,
 )
 from experiments.probabilistic_dataflow.scientific_model import CrossDomainTransformer
 
@@ -42,6 +38,8 @@ TEXT_SENTENCES = (
     ("bos", "the", "ocean", "contact", "changes", "today", "eos"),
     ("bos", "the", "protein", "field", "changes", "today", "eos"),
 )
+TEXT_TASK = "synthetic_text"
+SCIENCE_TASK = "synthetic_advection"
 
 
 @dataclass
@@ -72,40 +70,6 @@ class SyntheticTokenCodec:
         if value < 0 or value >= self.DATA_BINS:
             raise ValueError(f"Synthetic value {value} is outside [0, {self.DATA_BINS})")
         return self.DATA_OFFSET + value
-
-
-@dataclass(frozen=True)
-class TaskBatch:
-    name: str
-    documents: PackedDocuments
-
-    @property
-    def token_ids(self) -> np.ndarray:
-        return self.documents.token_ids
-
-    @property
-    def scientific_position_ids(self) -> np.ndarray:
-        return self.documents.feature_ids(SCIENTIFIC_POSITION_CHANNEL)
-
-    @property
-    def rotary_position_ids(self) -> np.ndarray:
-        return self.documents.rotary_position_ids
-
-    @property
-    def target_ids(self) -> np.ndarray:
-        return self.documents.target_ids
-
-    @property
-    def loss_weights(self) -> np.ndarray:
-        return self.documents.loss_weights
-
-    @property
-    def segment_ids(self) -> np.ndarray:
-        return self.documents.segment_ids
-
-    @property
-    def attention_layout(self) -> AttentionLayout:
-        return self.documents.attention_layout
 
 
 @dataclass(frozen=True)
@@ -140,39 +104,35 @@ def synthetic_advection_document(codec: SyntheticTokenCodec, *, seed: int) -> Do
     future = np.stack(future_steps)
 
     example_id = f"advection-{seed}"
-    records = []
+    tokens = []
     position = 0
     for value in (*initial, *forcing.flat):
-        records.append(
-            Record(
+        tokens.append(
+            Token(
                 codec.data(int(value)),
-                position_id=0,
-                features=(FeatureId(SCIENTIFIC_POSITION_CHANNEL, position),),
+                features=((SCIENTIFIC_POSITION_CHANNEL, position),),
             )
         )
         position += 1
-    for index, value in enumerate(future.flat):
-        records.append(
-            Record(
+    for value in future.flat:
+        tokens.append(
+            Token(
                 codec.QUERY_ID,
-                position_id=0,
-                features=(FeatureId(SCIENTIFIC_POSITION_CHANNEL, position),),
-                output=Output(
-                    OutputSlot(example_id, "future", index),
-                    Supervision(codec.data(int(value))),
-                ),
+                features=((SCIENTIFIC_POSITION_CHANNEL, position),),
+                query=True,
+                target_id=codec.data(int(value)),
             )
         )
         position += 1
     assert position == ADVECTION_RECORDS
-    return Document(example_id, tuple(records), AttentionLayout.FULL)
+    return Document(example_id, tuple(tokens), AttentionLayout.FULL)
 
 
 def record_order_equivariance_error(*, seed: int = 0) -> float:
     """Measure the maximum logit change after permuting and restoring scientific records."""
     codec = SyntheticTokenCodec()
     document = synthetic_advection_document(codec, seed=seed)
-    order = tuple(int(index) for index in np.random.default_rng(seed).permutation(len(document.records)))
+    order = tuple(int(index) for index in np.random.default_rng(seed).permutation(len(document.tokens)))
     permuted = document.reordered(order)
     config = GrugModelConfig(
         vocab_size=codec.vocab_size,
@@ -181,7 +141,7 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
         num_layers=2,
         num_heads=4,
         num_kv_heads=2,
-        max_seq_len=len(document.records),
+        max_seq_len=len(document.tokens),
     )
     with jax.set_mesh(compact_grug_mesh()):
         model = CrossDomainTransformer.init(
@@ -189,7 +149,7 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
             scientific_position_count=ADVECTION_RECORDS,
             key=jax.random.PRNGKey(seed),
         )
-        segment_ids = jnp.zeros((1, len(document.records)), dtype=jnp.int32)
+        segment_ids = jnp.zeros((1, len(document.tokens)), dtype=jnp.int32)
         mask = AttentionMask().with_segment_ids(segment_ids)
         logits = model.logits(
             jnp.asarray((document.token_ids,)),
@@ -208,7 +168,7 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
     return float(np.max(np.abs(np.asarray(logits) - restored_logits)))
 
 
-def build_synthetic_text_batch(codec: SyntheticTokenCodec, *, repetitions: int = 4) -> TaskBatch:
+def build_synthetic_text_batch(codec: SyntheticTokenCodec, *, repetitions: int = 4) -> PackedBatch:
     """Build a small causal next-token workload in the shared token vocabulary."""
     if repetitions <= 0:
         raise ValueError(f"repetitions must be positive, got {repetitions}")
@@ -217,11 +177,10 @@ def build_synthetic_text_batch(codec: SyntheticTokenCodec, *, repetitions: int =
         causal_training_document(
             f"text-{index}",
             tuple(codec.token(word) for word in sentence),
-            sequence_name="text",
         )
         for index, sentence in enumerate(sentences)
     )
-    return TaskBatch("synthetic_text", pack_documents(documents, max_seq_len=len(TEXT_SENTENCES[0])))
+    return pack(documents, max_seq_len=len(TEXT_SENTENCES[0]))
 
 
 def build_synthetic_advection_batch(
@@ -229,12 +188,12 @@ def build_synthetic_advection_batch(
     *,
     examples: int = 8,
     max_seq_len: int = 64,
-) -> TaskBatch:
+) -> PackedBatch:
     """Build a batch of full-attention scientific documents."""
     if examples <= 0:
         raise ValueError(f"examples must be positive, got {examples}")
     documents = tuple(synthetic_advection_document(codec, seed=seed) for seed in range(examples))
-    return TaskBatch("synthetic_advection", pack_documents(documents, max_seq_len=max_seq_len))
+    return pack(documents, max_seq_len=max_seq_len)
 
 
 def train_cross_domain_smoke(
@@ -316,7 +275,7 @@ def train_cross_domain_smoke(
         final_loss=0.5 * (text_metrics.final_loss + science_metrics.final_loss),
         text=text_metrics,
         science=science_metrics,
-        task_families=(text_batch.name, science_batch.name),
+        task_families=(TEXT_TASK, SCIENCE_TASK),
         shared_vocab_size=codec.vocab_size,
     )
 
@@ -353,10 +312,10 @@ def _aligned_metrics(
     return loss, accuracy
 
 
-def _task_arrays(batch: TaskBatch) -> tuple[jax.Array, ...]:
+def _task_arrays(batch: PackedBatch) -> tuple[jax.Array, ...]:
     return (
         jnp.asarray(batch.token_ids),
-        jnp.asarray(batch.scientific_position_ids),
+        jnp.asarray(batch.feature_ids(SCIENTIFIC_POSITION_CHANNEL)),
         jnp.asarray(batch.rotary_position_ids),
         jnp.asarray(batch.target_ids),
         jnp.asarray(batch.loss_weights),
@@ -364,7 +323,7 @@ def _task_arrays(batch: TaskBatch) -> tuple[jax.Array, ...]:
     )
 
 
-def _task_attention_mask(batch: TaskBatch, segment_ids: jax.Array) -> AttentionMask:
+def _task_attention_mask(batch: PackedBatch, segment_ids: jax.Array) -> AttentionMask:
     if batch.attention_layout == AttentionLayout.CAUSAL:
         return AttentionMask.causal().with_segment_ids(segment_ids)
     return AttentionMask().with_segment_ids(segment_ids)

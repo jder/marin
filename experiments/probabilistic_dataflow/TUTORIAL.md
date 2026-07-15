@@ -1,87 +1,67 @@
-# Tutorial: from one document to adaptive scientific inference
+# Tutorial: direct document generators
 
 ## Orientation
 
-The reusable API in this experiment has two data structures and one control-flow
-convention:
+A document program has one model-facing data structure and one control-flow
+rule:
 
-- a `Document` contains the records for one isolated transformer call;
-- an `OutputSlot` identifies a logical prediction independently of the document
-  that requests it;
-- a Python generator yields a `DocumentRequest` and receives the corresponding
-  `DocumentResponse`.
+- a `Document` contains `Token` values for one isolated attention domain;
+- a Python generator yields a tuple of documents and receives a tuple of
+  positional results.
 
-The generator owns scientific control flow. It can split one prediction over
-several documents, select among overlapping observations, feed predictions into
-later documents, loop until a stopping condition, and delegate to subprograms.
-The executor owns model batching and result routing.
+The generator owns field coordinates, candidate selection, refinement state,
+branching, and loops. The executor owns batching and model execution. This
+tutorial builds a scalar call, overlapping windows, refinement, parallel
+subprograms, and training documents.
 
-This tutorial builds that path in five steps:
-
-1. encode one scalar prediction as a document;
-2. yield that document from a program and run it;
-3. split and overlap a logical field across context windows;
-4. add adaptive refinement and subprogram composition;
-5. pack the same document representation for training.
-
-The code is an experiment under `experiments/probabilistic_dataflow`, not a
+The code lives under `experiments/probabilistic_dataflow`; it is not a
 production Marin API.
 
-## 1. Encode one scalar prediction
+## 1. Encode one prediction
 
-Suppose the discretized current value is token `35`, and the training target is
-token `37`. The model input has two records: the observed value and a query for
-the future value.
+Suppose the current value is token `35` and the training target is token `37`.
+The document contains the observed value and a query token for the next value:
 
 ```python
 from experiments.probabilistic_dataflow.documents import (
     AttentionLayout,
     Document,
-    FeatureId,
-    Output,
-    OutputSlot,
-    Record,
-    Supervision,
+    Token,
 )
 
 QUERY_ID = 1
 CURRENT_ID = 35
 TARGET_ID = 37
 
-future_slot = OutputSlot("scalar-0", "future", 0)
-current_feature = (FeatureId("scientific_position", 0),)
-future_feature = (FeatureId("scientific_position", 1),)
-
-inference_document = Document(
-    "scalar-0/inference",
-    (
-        Record(CURRENT_ID, position_id=0, features=current_feature),
-        Record(
-            QUERY_ID,
-            position_id=0,
-            features=future_feature,
-            output=Output(future_slot),
-        ),
-    ),
-    AttentionLayout.FULL,
+current = Token(
+    CURRENT_ID,
+    features=(("scientific_position", 0),),
+)
+inference_query = Token(
+    QUERY_ID,
+    features=(("scientific_position", 1),),
+    query=True,
+)
+training_query = Token(
+    QUERY_ID,
+    features=(("scientific_position", 1),),
+    query=True,
+    target_id=TARGET_ID,
 )
 
+inference_document = Document(
+    "scalar/inference",
+    (current, inference_query),
+    AttentionLayout.FULL,
+)
 training_document = Document(
-    "scalar-0/training",
-    (
-        Record(CURRENT_ID, position_id=0, features=current_feature),
-        Record(
-            QUERY_ID,
-            position_id=0,
-            features=future_feature,
-            output=Output(future_slot, Supervision(TARGET_ID)),
-        ),
-    ),
+    "scalar/training",
+    (current, training_query),
     AttentionLayout.FULL,
 )
 ```
 
-The inference and training documents have the same model inputs:
+Inference and training have identical model inputs:
 
 ```python
 assert inference_document.token_ids == training_document.token_ids == (35, 1)
@@ -89,305 +69,218 @@ assert inference_document.target_ids == (-1, -1)
 assert training_document.target_ids == (-1, 37)
 ```
 
-`Supervision` is label metadata on an output record. Token `37` is absent from
-`training_document.token_ids`, so full attention cannot leak the target into the
-model input. Both records use rotary position `0`; their `scientific_position`
-features carry the scientific identity used by the existing scientific Grug
-wrapper.
+`target_id` is metadata for the loss. It is absent from `token_ids`, so the
+full-attention query cannot read token `37`. Both tokens use rotary position
+`0`; the `scientific_position` feature tells the model which field position each
+token represents.
 
-`future_slot` is the identity of the requested value. The document ID is only a
-description of this occurrence. Another document can request the same slot with
-a different context view.
+## 2. Yield the document
 
-## 2. Yield documents from a program
-
-A document program is a normal Python generator. One `yield` submits a barriered
-wave of documents and evaluates to the routed response when the program resumes.
+A `Program[T]` is a normal Python generator. One `yield` submits a tuple of
+documents and evaluates to one `Result` per document when execution finishes:
 
 ```python
 from experiments.probabilistic_dataflow.programs import (
-    GENERATED_FEEDBACK,
-    SAMPLED_FEEDBACK,
-    DocumentProgram,
-    DocumentRequest,
-    PredictionObservation,
-    disjoint_prediction_observations,
+    Prediction,
+    Program,
     mapped_executor,
-    run_program,
+    run,
 )
 
 
-def scalar_program(document: Document) -> DocumentProgram[int]:
-    response = yield DocumentRequest(
-        "scalar-0/predict",
-        (document,),
-        SAMPLED_FEEDBACK,
-    )
-    observations = disjoint_prediction_observations(response)
-    return observations[0].token_id
+def scalar_program(document: Document) -> Program[int]:
+    (result,) = yield (document,)
+    return result.predictions[0].token_id
 
 
-def fake_predict(document: Document) -> tuple[PredictionObservation, ...]:
-    return tuple(
-        PredictionObservation(slot, token_id=38, logprob=-0.2)
-        for slot in document.output_slots
-        if slot is not None
-    )
+def fake_predict(document: Document) -> tuple[Prediction, ...]:
+    return tuple(Prediction(token_id=38, logprob=-0.2) for _ in document.query_positions)
 
 
-run = run_program(
+result = run(
     scalar_program(inference_document),
     mapped_executor(fake_predict),
 )
-assert run.value == 38
+assert result.value == 38
 ```
 
-`mapped_executor` adapts a per-document function for small local programs and
-tests. A model-backed executor receives all ready requests, packs compatible
-documents, runs the model, and reconstructs the same `DocumentResponse` shape.
-The generator does not change.
+The outer tuple follows document occurrence order. `result.predictions` follows
+the document's `query_positions`. Document names are descriptions and may
+repeat.
 
-Each `DocumentResult` corresponds positionally to one requested document.
-`results[i]` satisfies `request.documents[i]`. This remains unambiguous when
-document IDs repeat.
+`run_many` advances several generators together. It collects their ready
+documents, calls the executor once, and returns each generator only its own
+result slice. A generator's later yield cannot cross its preceding barrier.
 
-`run_programs` advances several independent generators together. It collects
-one ready request from each program, executes that wave, and resumes each
-generator with only its response. A later request from one program cannot cross
-that program's preceding yield barrier.
+## 3. Split and overlap a field
 
-## 3. Split a prediction across context windows
-
-One logical field can span several documents. `ContextWindow` names the context
-tokens and logical field indices requested by each document:
+`split_windows` returns a domain dataclass containing the documents and the
+coordinates needed to join their positional results:
 
 ```python
 from experiments.probabilistic_dataflow.mock_windowed import (
-    ContextWindow,
-    forecast_slot,
+    split_windows,
     windowed_forecast_program,
 )
 
-windows = (
-    ContextWindow("left", context_token_ids=(10, 11), output_indices=(0, 1)),
-    ContextWindow("right", context_token_ids=(20, 21), output_indices=(1, 2)),
+split = split_windows(
+    "forecast-0",
+    context_token_ids=((10, 11), (20, 21)),
+    output_indices=((0, 1), (1, 2)),
 )
 ```
 
-Both windows request index `1`. The response keeps those two observations
-separate until the program applies `highest_logprob_observations`.
+Both documents query coordinate `1`. Each query token carries that coordinate
+as a model-visible feature. `WindowSplit.join_results` keeps the two predictions
+separate until it selects the higher-log-probability candidate:
 
 ```python
-def window_predict(document: Document) -> tuple[PredictionObservation, ...]:
-    context_token = document.token_ids[0]
-    observations = []
-    for slot in document.output_slots:
-        if slot is None:
-            continue
-        if slot.index == 1 and context_token == 10:
-            observations.append(PredictionObservation(slot, token_id=301, logprob=-2.0))
-        elif slot.index == 1:
-            observations.append(PredictionObservation(slot, token_id=401, logprob=-0.2))
-        else:
-            observations.append(PredictionObservation(slot, token_id=300 + slot.index, logprob=-0.1))
-    return tuple(observations)
+results = yield split.documents
+values = split.join_results(results)
+```
 
+No logical output key crosses the executor boundary. The generator already has
+the `WindowSplit` needed to assemble the field. It can feed `values` into later
+documents as ordinary context tokens. The complete program is:
 
-run = run_program(
-    windowed_forecast_program(
-        "forecast-0",
-        windows,
-        continuation_output_indices=(3,),
-    ),
-    mapped_executor(window_predict),
-)
-
-state = run.value
-assert tuple(state.value(forecast_slot("forecast-0", index)) for index in range(4)) == (
-    300,
-    401,
-    302,
-    303,
+```python
+program = windowed_forecast_program(
+    split,
+    continuation_output_indices=(3,),
 )
 ```
 
-The right window wins index `1` because `-0.2` is greater than `-2.0`. The
-program commits one value per slot to `PredictionState`, materializes indices
-`0`, `1`, and `2` as context records, then yields a continuation document for
-index `3`.
+The executable example is
+[`mock_windowed.py`](mock_windowed.py). It also builds a continuation document
+whose query coordinates follow the materialized initial predictions.
 
-`PredictionState.updated` makes write intent explicit:
+## 4. Refine selected coordinates
 
-- `REQUIRE_EMPTY` inserts predictions and rejects an existing slot;
-- `REPLACE` updates predictions and rejects an unknown slot.
-
-This catches two common routing errors: accidentally committing overlapping
-observations without a selection policy, and refining a newly constructed slot
-instead of the original prediction.
-
-## 4. Refine and compose programs
-
-### Adaptive partial refinement
-
-`iterative_refinement_program` proposes a field, finds coordinates below a
-log-probability threshold, and yields new documents for only those coordinates.
-It does not require target values at inference time.
+`refine` returns a `Refinement` dataclass containing the observed field, output
+shape, sharding parameters, confidence threshold, and round limit:
 
 ```python
-from experiments.probabilistic_dataflow.mock_refinement import iterative_refinement_program
+from experiments.probabilistic_dataflow.mock_refinement import refine
 
-refinement = iterative_refinement_program(
+refinement = refine(
     example_id="field-0",
     observed_token_ids=(5, 6),
     num_outputs=4,
     outputs_per_document=2,
     minimum_logprob=-0.5,
     max_refinement_rounds=3,
-    accepted_feedback=SAMPLED_FEEDBACK,
 )
 ```
 
-The first request contains two documents, each requesting two disjoint output
-slots. After sampling, the generator stores the four observations and their
-log-probabilities. Each refinement document uses tokens from that sampled state
-as context. Unselected coordinates remain unchanged.
-
-Training uses the same control flow through an explicit labeled constructor:
+`Refinement.documents()` is a `Program[RefinementResult]`. It yields the initial
+proposal documents, stores their positional predictions in dictionaries, and
+yields replacement documents until every coordinate is confident or the round
+limit is reached:
 
 ```python
-from experiments.probabilistic_dataflow.mock_refinement import (
-    supervised_iterative_refinement_program,
-)
+result = yield from refinement.documents()
+assert result.refinement_rounds <= 3
+```
 
-training_refinement = supervised_iterative_refinement_program(
+At a top-level execution boundary, pass the same generator to `run`:
+
+```python
+completed = run(refinement.documents(), executor)
+final_token_ids = completed.value.token_ids
+```
+
+Training labels are another field on the domain value:
+
+```python
+labeled_refinement = refine(
     example_id="field-0",
     observed_token_ids=(5, 6),
-    target_token_ids=(100, 101, 102, 103),
+    num_outputs=4,
     outputs_per_document=2,
     minimum_logprob=-0.5,
     max_refinement_rounds=3,
-    accepted_feedback=SAMPLED_FEEDBACK,
+    target_token_ids=(100, 101, 102, 103),
 )
 ```
 
-The labels supervise each query record. They do not become refinement context.
-For refinement training from deliberately perturbed proposals, use
-`GENERATED_FEEDBACK`, which accepts sampled and corrupted observations while
-still rejecting supervised feedback as runtime state.
+Labels stay on query tokens and never become refinement context.
 
-### Sequential and parallel subprograms
-
-Normal generator delegation handles sequential composition:
+`run` accepts sampled results by default. Deliberately corrupted proposals use:
 
 ```python
-from experiments.probabilistic_dataflow.mock_composition import (
-    SpecialistResources,
-    chemistry_program,
-    geometry_program,
-    planning_program,
-    verification_program,
-)
-from experiments.probabilistic_dataflow.programs import parallel_programs
+from experiments.probabilistic_dataflow.programs import GENERATED_ORIGINS
 
-
-def specialist_program(
-    example_id: str,
-    resources: SpecialistResources,
-) -> DocumentProgram[tuple[int, int, bool]]:
-    plan = yield from planning_program(example_id)
-    geometry_token, chemistry_token = yield from parallel_programs(
-        (
-            geometry_program(example_id, plan, resources),
-            chemistry_program(example_id, resources),
-        ),
-        request_prefix=f"{example_id}/specialists",
-    )
-    accepted = yield from verification_program(
-        example_id,
-        geometry_token,
-        chemistry_token,
-        attempt=0,
-    )
-    return geometry_token, chemistry_token, accepted
+result = run(program, executor, accepted_origins=GENERATED_ORIGINS)
 ```
 
-`yield from` handles the planning and verification calls sequentially.
-`parallel_programs` is the small extra combinator needed for adaptive children
-whose ready documents should share execution waves.
+## 5. Compose adaptive programs
 
-The geometry child may yield a coarse document and then a refinement document.
-The chemistry child may finish after one document. `parallel_programs` exposes
-both initial documents together, resumes each child with its positional slice,
-then exposes only geometry's second request. The parent proceeds to verification
-after both children return.
+Sequential composition uses Python's `yield from`:
 
-See [`mock_composition.py`](mock_composition.py) for planning, unequal specialist
+```python
+refine_geometry = yield from planning_program(example_id)
+accepted = yield from verification_program(
+    example_id,
+    geometry_token,
+    chemistry_token,
+    attempt=0,
+)
+```
+
+`parallel` advances adaptive children together:
+
+```python
+from experiments.probabilistic_dataflow.programs import parallel
+
+geometry_token, chemistry_token = yield from parallel(
+    (
+        geometry_program(example_id, refine_geometry, resources),
+        chemistry_program(example_id, resources),
+    )
+)
+```
+
+Geometry may yield a coarse document and a refinement document. Chemistry may
+finish after one document. `parallel` exposes both initial documents together,
+returns each positional result slice to its child, and then exposes only the
+geometry refinement. The parent resumes after both children finish.
+
+[`mock_composition.py`](mock_composition.py) includes planning, unequal child
 workloads, verification, conditional retry, and cleanup of suspended children
-after an executor failure.
+after executor failure.
 
-## 5. Pack the same documents for training
+## 6. Pack documents for training and inference
 
-`pack_documents` converts documents with one attention layout into dense arrays
-while retaining document and output locations:
+`pack` converts documents with one attention layout into dense arrays:
 
 ```python
-from experiments.probabilistic_dataflow.documents import pack_documents
+from experiments.probabilistic_dataflow.documents import pack
 
-batch = pack_documents((training_document,), max_seq_len=8)
+batch = pack((training_document,), max_seq_len=8)
 
 assert batch.token_ids.shape == (1, 8)
 assert batch.target_ids[0, 1] == TARGET_ID
-assert batch.loss_weights[0, 1] == 1.0
-assert batch.outputs[0].slot == future_slot
+assert batch.query_mask[0, 1]
 ```
 
-The packed batch carries:
+`PackedBatch` carries token IDs, feature arrays, rotary positions, targets,
+weights, segments, document indices, and a query mask. `packed_executor` samples
+the query-mask positions and reconstructs one `Result` per document occurrence.
 
-- input token, feature, and rotary-position IDs;
-- segment IDs that isolate documents in attention;
-- aligned target IDs and loss weights;
-- the physical row and position of each logical `OutputSlot`.
-
-`packed_executor` uses those output locations to route sampled tokens and
-log-probabilities back to document occurrences. It groups ready documents by
-`AttentionLayout`, so full-attention scientific records and causal text use the
-same model parameters in separate dense calls.
-
-Causal text uses the same document representation. The record containing token
-`i` predicts the slot for token `i + 1`:
+Causal text uses the same representation. The token at position `i` is a query
+for token `i + 1`:
 
 ```python
 from experiments.probabilistic_dataflow.documents import causal_training_document
 
-text_document = causal_training_document(
-    "text-0",
-    token_ids=(2, 3, 4, 5),
-    sequence_name="text",
-)
+text_document = causal_training_document("text-0", (5, 6, 7, 8))
+
 assert text_document.attention_layout == AttentionLayout.CAUSAL
-assert text_document.target_ids == (3, 4, 5, -1)
+assert text_document.token_ids == (5, 6, 7, 8)
+assert text_document.target_ids == (6, 7, 8, -1)
 ```
 
-The cross-domain smoke test trains one Grug parameter set on packed causal text
-and full-attention scientific documents:
-
-```python
-from experiments.probabilistic_dataflow.training import train_cross_domain_smoke
-
-result = train_cross_domain_smoke(steps=80, examples_per_task=8, seed=0)
-```
-
-The checked-in CPU smoke reduced combined training loss from `4.1909` to
-`0.2022`. This demonstrates model and optimization compatibility on a memorized
-synthetic workload. It does not measure held-out scientific prediction,
-language quality, or refinement quality.
-
-Run the document-program behavior tests from the repository root:
-
-```bash
-uv run pytest -q \
-  tests/experiment/test_document_programs.py \
-  tests/experiment/test_mock_refinement_program.py \
-  tests/experiment/test_mock_windowed_program.py \
-  tests/experiment/test_mock_composition_program.py
-```
+[`training.py`](training.py) packs causal text and full-attention advection
+documents for one Grug model. The position features and attention layout change;
+the token embedding table, transformer parameters, output projection, and loss
+remain shared.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 
 import numpy as np
 
@@ -14,271 +15,139 @@ class AttentionLayout(StrEnum):
     CAUSAL = "causal_segment"
 
 
-@dataclass(frozen=True, order=True)
-class OutputSlot:
-    """Stable identity for one value predicted by one or more documents."""
-
-    example_id: str
-    value_name: str
-    index: int
-
-
 @dataclass(frozen=True)
-class FeatureId:
-    """One categorical embedding feature attached to a record."""
-
-    channel: str
-    value: int
-
-
-@dataclass(frozen=True)
-class Supervision:
-    target_id: int
-    weight: float = 1.0
-
-
-@dataclass(frozen=True)
-class Output:
-    slot: OutputSlot
-    supervision: Supervision | None = None
-
-
-@dataclass(frozen=True)
-class Record:
-    """One transformer position with input features and an optional logical output."""
+class Token:
+    """One transformer position, including optional query and training metadata."""
 
     input_id: int
-    position_id: int
-    features: tuple[FeatureId, ...] = ()
-    output: Output | None = None
+    position_id: int = 0
+    features: tuple[tuple[str, int], ...] = ()
+    query: bool = False
+    target_id: int | None = None
+    target_weight: float = 1.0
 
     def __post_init__(self) -> None:
-        channels = [feature.channel for feature in self.features]
+        channels = [channel for channel, _value in self.features]
         if len(channels) != len(set(channels)):
-            raise ValueError(f"Record contains duplicate feature channels: {channels}")
+            raise ValueError(f"Token contains duplicate feature channels: {channels}")
+        if self.target_id is not None and not self.query:
+            raise ValueError("A training target must be attached to a query token")
+        if not isfinite(self.target_weight) or self.target_weight < 0:
+            raise ValueError(f"Target weight must be finite and non-negative, got {self.target_weight}")
 
 
 @dataclass(frozen=True)
 class Document:
-    """An isolated attention domain containing encoded model records."""
+    """An isolated attention domain containing encoded model tokens."""
 
-    id: str
-    records: tuple[Record, ...]
+    name: str
+    tokens: tuple[Token, ...]
     attention_layout: AttentionLayout
 
     def __post_init__(self) -> None:
-        if not self.records:
-            raise ValueError("A document requires at least one record")
+        if not self.tokens:
+            raise ValueError("A document requires at least one token")
 
     @property
     def token_ids(self) -> tuple[int, ...]:
-        return tuple(record.input_id for record in self.records)
+        return tuple(token.input_id for token in self.tokens)
 
     @property
     def rotary_position_ids(self) -> tuple[int, ...]:
-        return tuple(record.position_id for record in self.records)
+        return tuple(token.position_id for token in self.tokens)
 
     @property
     def target_ids(self) -> tuple[int, ...]:
-        return tuple(
-            (
-                record.output.supervision.target_id
-                if record.output is not None and record.output.supervision is not None
-                else -1
-            )
-            for record in self.records
-        )
+        return tuple(token.target_id if token.target_id is not None else -1 for token in self.tokens)
 
     @property
     def loss_weights(self) -> tuple[float, ...]:
-        return tuple(
-            (
-                record.output.supervision.weight
-                if record.output is not None and record.output.supervision is not None
-                else 0.0
-            )
-            for record in self.records
-        )
+        return tuple(token.target_weight if token.target_id is not None else 0.0 for token in self.tokens)
 
     @property
-    def output_slots(self) -> tuple[OutputSlot | None, ...]:
-        return tuple(record.output.slot if record.output is not None else None for record in self.records)
+    def query_positions(self) -> tuple[int, ...]:
+        return tuple(index for index, token in enumerate(self.tokens) if token.query)
 
     @property
     def feature_channels(self) -> tuple[str, ...]:
-        return tuple(sorted({feature.channel for record in self.records for feature in record.features}))
+        return tuple(sorted({channel for token in self.tokens for channel, _value in token.features}))
 
     def feature_ids(self, channel: str) -> tuple[int, ...]:
         return tuple(
-            next((feature.value for feature in record.features if feature.channel == channel), -1)
-            for record in self.records
+            next((value for feature_channel, value in token.features if feature_channel == channel), -1)
+            for token in self.tokens
         )
 
     def reordered(self, order: tuple[int, ...]) -> Document:
-        """Return the same records in a different physical order."""
-        if tuple(sorted(order)) != tuple(range(len(self.records))):
-            raise ValueError("Record order must be a permutation of all document positions")
-        return Document(self.id, tuple(self.records[index] for index in order), self.attention_layout)
+        """Return the same tokens in a different physical order."""
+        if tuple(sorted(order)) != tuple(range(len(self.tokens))):
+            raise ValueError("Token order must be a permutation of all document positions")
+        return Document(self.name, tuple(self.tokens[index] for index in order), self.attention_layout)
 
-    def selected(self, document_id: str, record_indices: tuple[int, ...]) -> Document:
-        """Create a context view or prediction shard over selected records."""
-        if len(set(record_indices)) != len(record_indices):
-            raise ValueError("A document view cannot repeat record indices")
-        if any(index < 0 or index >= len(self.records) for index in record_indices):
-            raise IndexError(f"Record view {record_indices} is outside document length {len(self.records)}")
-        return Document(document_id, tuple(self.records[index] for index in record_indices), self.attention_layout)
+    def selected(self, name: str, token_indices: tuple[int, ...]) -> Document:
+        """Create a context view or prediction shard over selected tokens."""
+        if len(set(token_indices)) != len(token_indices):
+            raise ValueError("A document view cannot repeat token indices")
+        if any(index < 0 or index >= len(self.tokens) for index in token_indices):
+            raise IndexError(f"Token view {token_indices} is outside document length {len(self.tokens)}")
+        return Document(name, tuple(self.tokens[index] for index in token_indices), self.attention_layout)
 
 
-def causal_training_document(document_id: str, token_ids: tuple[int, ...], *, sequence_name: str) -> Document:
-    """Encode shifted next-token supervision as aligned document outputs."""
+def causal_training_document(name: str, token_ids: tuple[int, ...]) -> Document:
+    """Encode shifted next-token supervision as aligned query tokens."""
     if len(token_ids) < 2:
         raise ValueError("Causal training documents require at least two tokens")
-    records = []
-    for index, token_id in enumerate(token_ids):
-        output = None
-        if index + 1 < len(token_ids):
-            slot = OutputSlot(document_id, sequence_name, index + 1)
-            output = Output(slot, Supervision(token_ids[index + 1]))
-        records.append(Record(token_id, index, output=output))
-    return Document(document_id, tuple(records), AttentionLayout.CAUSAL)
+    tokens = tuple(
+        Token(
+            token_id,
+            position_id=index,
+            query=index + 1 < len(token_ids),
+            target_id=token_ids[index + 1] if index + 1 < len(token_ids) else None,
+        )
+        for index, token_id in enumerate(token_ids)
+    )
+    return Document(name, tokens, AttentionLayout.CAUSAL)
 
 
 @dataclass(frozen=True)
-class PredictionValue:
-    slot: OutputSlot
-    token_id: int
-
-
-class PredictionUpdateMode(StrEnum):
-    REQUIRE_EMPTY = "require_empty"
-    REPLACE = "replace"
-
-
-@dataclass(frozen=True)
-class PredictionState:
-    """Immutable materialized values keyed by logical output slot."""
-
-    values: tuple[PredictionValue, ...] = ()
-
-    def __post_init__(self) -> None:
-        slots = [prediction.slot for prediction in self.values]
-        if len(slots) != len(set(slots)):
-            raise ValueError("Prediction state cannot contain the same output slot more than once")
-
-    def value(self, slot: OutputSlot) -> int:
-        for prediction in self.values:
-            if prediction.slot == slot:
-                return prediction.token_id
-        raise KeyError(slot)
-
-    def updated(
-        self,
-        predictions: tuple[PredictionValue, ...],
-        *,
-        mode: PredictionUpdateMode,
-    ) -> PredictionState:
-        prediction_slots = [prediction.slot for prediction in predictions]
-        if len(prediction_slots) != len(set(prediction_slots)):
-            raise ValueError("One prediction update cannot contain the same output slot more than once")
-
-        current = {prediction.slot: prediction for prediction in self.values}
-        incoming = set(prediction_slots)
-        current_slots = set(current)
-        if mode == PredictionUpdateMode.REQUIRE_EMPTY:
-            overlap = current_slots & incoming
-            if overlap:
-                raise ValueError(f"Prediction update would overwrite existing slots: {sorted(overlap)}")
-        elif mode == PredictionUpdateMode.REPLACE:
-            missing = incoming - current_slots
-            if missing:
-                raise ValueError(f"Prediction replacement requires existing slots: {sorted(missing)}")
-        current.update((prediction.slot, prediction) for prediction in predictions)
-        return PredictionState(tuple(current[slot] for slot in sorted(current)))
-
-
-def prediction_input_record(
-    state: PredictionState,
-    slot: OutputSlot,
-    *,
-    position_id: int,
-    features: tuple[FeatureId, ...] = (),
-) -> Record:
-    """Materialize a previously predicted value as document context."""
-    return Record(state.value(slot), position_id, features=features)
-
-
-@dataclass(frozen=True)
-class PackedFeatureIds:
-    channel: str
-    ids: np.ndarray
-
-
-@dataclass(frozen=True)
-class PackedDocumentLocation:
-    document_index: int
-    document_id: str
-    row: int
-    start: int
-    end: int
-
-
-@dataclass(frozen=True)
-class PackedOutputLocation:
-    document_index: int
-    slot: OutputSlot
-    row: int
-    position: int
-
-
-@dataclass(frozen=True)
-class PackedDocuments:
+class PackedBatch:
     token_ids: np.ndarray
-    features: tuple[PackedFeatureIds, ...]
+    features: dict[str, np.ndarray]
     rotary_position_ids: np.ndarray
     target_ids: np.ndarray
     loss_weights: np.ndarray
     segment_ids: np.ndarray
+    document_indices: np.ndarray
+    query_mask: np.ndarray
     attention_layout: AttentionLayout
-    locations: tuple[PackedDocumentLocation, ...]
-    outputs: tuple[PackedOutputLocation, ...]
 
     def feature_ids(self, channel: str) -> np.ndarray:
-        for feature in self.features:
-            if feature.channel == channel:
-                return feature.ids
-        return np.full_like(self.token_ids, -1)
-
-    def prediction_values(self, sampled_token_ids: np.ndarray) -> tuple[PredictionValue, ...]:
-        """Associate sampled tokens at output positions with their logical slots."""
-        if sampled_token_ids.shape != self.token_ids.shape:
-            raise ValueError(
-                f"Sampled tokens must have packed shape {self.token_ids.shape}, got {sampled_token_ids.shape}"
-            )
-        return tuple(
-            PredictionValue(output.slot, int(sampled_token_ids[output.row, output.position])) for output in self.outputs
-        )
+        feature_ids = self.features.get(channel)
+        if feature_ids is None:
+            return np.full_like(self.token_ids, -1)
+        return feature_ids
 
 
-def pack_documents(documents: tuple[Document, ...], *, max_seq_len: int) -> PackedDocuments:
-    """Greedily pack documents while preserving attention and output boundaries."""
+def pack(documents: tuple[Document, ...], *, max_seq_len: int) -> PackedBatch:
+    """Greedily pack documents while preserving attention and document boundaries."""
     if not documents:
         raise ValueError("Cannot pack an empty document collection")
     attention_layouts = {document.attention_layout for document in documents}
     if len(attention_layouts) != 1:
         raise ValueError(f"Packed documents must share one attention layout, got {sorted(attention_layouts)}")
     attention_layout = attention_layouts.pop()
-    if any(len(document.records) > max_seq_len for document in documents):
-        longest = max(len(document.records) for document in documents)
+    if any(len(document.tokens) > max_seq_len for document in documents):
+        longest = max(len(document.tokens) for document in documents)
         raise ValueError(f"Document length {longest} exceeds max_seq_len={max_seq_len}")
 
     rows: list[list[tuple[int, Document]]] = [[]]
     row_lengths = [0]
     for document_index, document in enumerate(documents):
-        if row_lengths[-1] + len(document.records) > max_seq_len:
+        if row_lengths[-1] + len(document.tokens) > max_seq_len:
             rows.append([])
             row_lengths.append(0)
         rows[-1].append((document_index, document))
-        row_lengths[-1] += len(document.records)
+        row_lengths[-1] += len(document.tokens)
 
     shape = (len(rows), max_seq_len)
     token_ids = np.zeros(shape, dtype=np.int32)
@@ -286,36 +155,34 @@ def pack_documents(documents: tuple[Document, ...], *, max_seq_len: int) -> Pack
     target_ids = np.full(shape, -1, dtype=np.int32)
     loss_weights = np.zeros(shape, dtype=np.float32)
     segment_ids = np.full(shape, -1, dtype=np.int32)
+    document_indices = np.full(shape, -1, dtype=np.int32)
+    query_mask = np.zeros(shape, dtype=np.bool_)
     channels = tuple(sorted({channel for document in documents for channel in document.feature_channels}))
-    feature_arrays = {channel: np.full(shape, -1, dtype=np.int32) for channel in channels}
-    locations = []
-    outputs = []
+    features = {channel: np.full(shape, -1, dtype=np.int32) for channel in channels}
 
     for row_index, row in enumerate(rows):
         offset = 0
         for segment_id, (document_index, document) in enumerate(row):
-            end = offset + len(document.records)
+            end = offset + len(document.tokens)
             token_ids[row_index, offset:end] = document.token_ids
             rotary_position_ids[row_index, offset:end] = document.rotary_position_ids
             target_ids[row_index, offset:end] = document.target_ids
             loss_weights[row_index, offset:end] = document.loss_weights
             segment_ids[row_index, offset:end] = segment_id
+            document_indices[row_index, offset:end] = document_index
+            query_mask[row_index, offset:end] = tuple(token.query for token in document.tokens)
             for channel in channels:
-                feature_arrays[channel][row_index, offset:end] = document.feature_ids(channel)
-            locations.append(PackedDocumentLocation(document_index, document.id, row_index, offset, end))
-            for position, slot in enumerate(document.output_slots):
-                if slot is not None:
-                    outputs.append(PackedOutputLocation(document_index, slot, row_index, offset + position))
+                features[channel][row_index, offset:end] = document.feature_ids(channel)
             offset = end
 
-    return PackedDocuments(
+    return PackedBatch(
         token_ids=token_ids,
-        features=tuple(PackedFeatureIds(channel, feature_arrays[channel]) for channel in channels),
+        features=features,
         rotary_position_ids=rotary_position_ids,
         target_ids=target_ids,
         loss_weights=loss_weights,
         segment_ids=segment_ids,
+        document_indices=document_indices,
+        query_mask=query_mask,
         attention_layout=attention_layout,
-        locations=tuple(locations),
-        outputs=tuple(outputs),
     )
