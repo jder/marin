@@ -5,7 +5,8 @@
 A document program has one model-facing data structure and one control-flow
 rule:
 
-- a `Document` contains `Token` values for one isolated attention domain;
+- a `Document` contains token IDs and aligned coordinates for one isolated
+  attention domain;
 - a Python generator yields a tuple of documents and receives a tuple of
   positional results.
 
@@ -24,55 +25,55 @@ The document contains the observed value and a query token for the next value:
 
 ```python
 from experiments.probabilistic_dataflow.documents import (
+    POSITION_IDS,
+    QUERY,
+    TARGET_IDS,
     AttentionLayout,
+    Coordinate,
     Document,
-    Token,
 )
 
 QUERY_ID = 1
 CURRENT_ID = 35
 TARGET_ID = 37
+SCIENTIFIC_POSITION = Coordinate("scientific_position")
 
-current = Token(
-    CURRENT_ID,
-    features=(("scientific_position", 0),),
-)
-inference_query = Token(
-    QUERY_ID,
-    features=(("scientific_position", 1),),
-    query=True,
-)
-training_query = Token(
-    QUERY_ID,
-    features=(("scientific_position", 1),),
-    query=True,
-    target_id=TARGET_ID,
-)
+coordinates = {
+    POSITION_IDS: (0, 0),
+    SCIENTIFIC_POSITION: (0, 1),
+    QUERY: (False, True),
+}
 
 inference_document = Document(
-    "scalar/inference",
-    (current, inference_query),
-    AttentionLayout.FULL,
+    (CURRENT_ID, QUERY_ID),
+    coordinates,
+    attention=AttentionLayout.FULL,
 )
 training_document = Document(
-    "scalar/training",
-    (current, training_query),
-    AttentionLayout.FULL,
+    (CURRENT_ID, QUERY_ID),
+    coordinates | {TARGET_IDS: (TARGET_IDS.missing, TARGET_ID)},
+    attention=AttentionLayout.FULL,
 )
 ```
 
 Inference and training have identical model inputs:
 
 ```python
-assert inference_document.token_ids == training_document.token_ids == (35, 1)
-assert inference_document.target_ids == (-1, -1)
-assert training_document.target_ids == (-1, 37)
+assert tuple(inference_document.token_ids) == tuple(training_document.token_ids) == (35, 1)
+assert tuple(inference_document[TARGET_IDS]) == (-1, -1)
+assert tuple(training_document[TARGET_IDS]) == (-1, 37)
 ```
 
-`target_id` is metadata for the loss. It is absent from `token_ids`, so the
+`TARGET_IDS` is metadata for the loss. It is absent from `token_ids`, so the
 full-attention query cannot read token `37`. Both tokens use rotary position
-`0`; the `scientific_position` feature tells the model which field position each
-token represents.
+`0`; `SCIENTIFIC_POSITION` tells the model which field position each token
+represents.
+
+Coordinates are keyed by object identity. A domain may define another
+coordinate named `scientific_position` without colliding with this one. Use
+`document[SCIENTIFIC_POSITION]` for canonical access. The shortcut
+`document.scientific_position` works when the document has only one coordinate
+with that name.
 
 ## 2. Yield the document
 
@@ -105,8 +106,7 @@ assert result.value == 38
 ```
 
 The outer tuple follows document occurrence order. `result.predictions` follows
-the document's `query_positions`. Document names are descriptions and may
-repeat.
+the document's `query_positions`.
 
 `run_many` advances several generators together. It collects their ready
 documents, calls the executor once, and returns each generator only its own
@@ -114,56 +114,47 @@ result slice. A generator's later yield cannot cross its preceding barrier.
 
 ## 3. Split and overlap a field
 
-`split_windows` returns a domain dataclass containing the documents and the
-coordinates needed to join their positional results:
+`predict_windows` is a subprogram that constructs the window documents and
+joins their positional results:
 
 ```python
-from experiments.probabilistic_dataflow.mock_windowed import (
-    split_windows,
-    windowed_forecast_program,
-)
+from experiments.probabilistic_dataflow.mock_windowed import continue_forecast, predict_windows
 
-split = split_windows(
-    "forecast-0",
-    context_token_ids=((10, 11), (20, 21)),
-    output_indices=((0, 1), (1, 2)),
+values = yield from predict_windows(
+    ((10, 11), (20, 21)),
+    ((0, 1), (1, 2)),
 )
 ```
 
-Both documents query coordinate `1`. Each query token carries that coordinate
-as a model-visible feature. `WindowSplit.join_results` keeps the two predictions
-separate until it selects the higher-log-probability candidate:
+Both documents query coordinate `1`. Each query position carries that
+model-visible coordinate. The subprogram keeps the two predictions separate
+until it selects the higher-log-probability candidate. No logical output key
+crosses the executor boundary.
+
+Compose a second subprogram when later predictions depend on the joined values:
 
 ```python
-results = yield split.documents
-values = split.join_results(results)
-```
-
-No logical output key crosses the executor boundary. The generator already has
-the `WindowSplit` needed to assemble the field. It can feed `values` into later
-documents as ordinary context tokens. The complete program is:
-
-```python
-program = windowed_forecast_program(
-    split,
-    continuation_output_indices=(3,),
+continuation = yield from continue_forecast(
+    values,
+    query_indices=(3,),
 )
+values.update(continuation)
 ```
 
 The executable example is
-[`mock_windowed.py`](mock_windowed.py). It also builds a continuation document
-whose query coordinates follow the materialized initial predictions.
+[`mock_windowed.py`](mock_windowed.py). `predict_windows` owns only the split and
+join. `continue_forecast` builds a new document from the materialized values,
+so the parent generator makes the dependency between waves explicit.
 
 ## 4. Refine selected coordinates
 
-`refine` returns a `Refinement` dataclass containing the observed field, output
-shape, sharding parameters, confidence threshold, and round limit:
+`refine` is an adaptive subprogram. Its arguments specify the observed field,
+output shape, sharding, confidence threshold, and round limit:
 
 ```python
 from experiments.probabilistic_dataflow.mock_refinement import refine
 
-refinement = refine(
-    example_id="field-0",
+result = yield from refine(
     observed_token_ids=(5, 6),
     num_outputs=4,
     outputs_per_document=2,
@@ -172,28 +163,30 @@ refinement = refine(
 )
 ```
 
-`Refinement.documents()` is a `Program[RefinementResult]`. It yields the initial
-proposal documents, stores their positional predictions in dictionaries, and
-yields replacement documents until every coordinate is confident or the round
-limit is reached:
-
-```python
-result = yield from refinement.documents()
-assert result.refinement_rounds <= 3
-```
+`refine` yields the initial proposal documents, stores their positional
+predictions in dictionaries, and yields replacement documents until every
+coordinate is confident or the round limit is reached.
 
 At a top-level execution boundary, pass the same generator to `run`:
 
 ```python
-completed = run(refinement.documents(), executor)
+completed = run(
+    refine(
+        observed_token_ids=(5, 6),
+        num_outputs=4,
+        outputs_per_document=2,
+        minimum_logprob=-0.5,
+        max_refinement_rounds=3,
+    ),
+    executor,
+)
 final_token_ids = completed.value.token_ids
 ```
 
-Training labels are another field on the domain value:
+Training labels are an optional subprogram argument:
 
 ```python
-labeled_refinement = refine(
-    example_id="field-0",
+labeled_result = yield from refine(
     observed_token_ids=(5, 6),
     num_outputs=4,
     outputs_per_document=2,
@@ -218,9 +211,8 @@ result = run(program, executor, accepted_origins=GENERATED_ORIGINS)
 Sequential composition uses Python's `yield from`:
 
 ```python
-refine_geometry = yield from planning_program(example_id)
+refine_geometry = yield from planning_program()
 accepted = yield from verification_program(
-    example_id,
     geometry_token,
     chemistry_token,
     attempt=0,
@@ -234,8 +226,8 @@ from experiments.probabilistic_dataflow.programs import parallel
 
 geometry_token, chemistry_token = yield from parallel(
     (
-        geometry_program(example_id, refine_geometry, resources),
-        chemistry_program(example_id, resources),
+        geometry_program(refine_geometry, resources),
+        chemistry_program(resources),
     )
 )
 ```
@@ -254,18 +246,18 @@ after executor failure.
 `pack` converts documents with one attention layout into dense arrays:
 
 ```python
-from experiments.probabilistic_dataflow.documents import pack
+from experiments.probabilistic_dataflow.documents import QUERY, TARGET_IDS, pack
 
 batch = pack((training_document,), max_seq_len=8)
 
 assert batch.token_ids.shape == (1, 8)
-assert batch.target_ids[0, 1] == TARGET_ID
-assert batch.query_mask[0, 1]
+assert batch[TARGET_IDS][0, 1] == TARGET_ID
+assert batch[QUERY][0, 1]
 ```
 
-`PackedBatch` carries token IDs, feature arrays, rotary positions, targets,
-weights, segments, document indices, and a query mask. `packed_executor` samples
-the query-mask positions and reconstructs one `Result` per document occurrence.
+`PackedBatch` carries token IDs, aligned coordinates, segments, and document
+indices. `packed_executor` samples positions marked by `QUERY` and reconstructs
+one `Result` per document occurrence.
 
 Causal text uses the same representation. The token at position `i` is a query
 for token `i + 1`:
@@ -273,14 +265,14 @@ for token `i + 1`:
 ```python
 from experiments.probabilistic_dataflow.documents import causal_training_document
 
-text_document = causal_training_document("text-0", (5, 6, 7, 8))
+text_document = causal_training_document((5, 6, 7, 8))
 
-assert text_document.attention_layout == AttentionLayout.CAUSAL
-assert text_document.token_ids == (5, 6, 7, 8)
-assert text_document.target_ids == (6, 7, 8, -1)
+assert text_document.attention == AttentionLayout.CAUSAL
+assert tuple(text_document.token_ids) == (5, 6, 7, 8)
+assert tuple(text_document[TARGET_IDS]) == (6, 7, 8, -1)
 ```
 
 [`training.py`](training.py) packs causal text and full-attention advection
-documents for one Grug model. The position features and attention layout change;
+documents for one Grug model. The coordinates and attention layout change;
 the token embedding table, transformer parameters, output projection, and loss
 remain shared.

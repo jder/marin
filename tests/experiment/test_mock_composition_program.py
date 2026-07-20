@@ -10,12 +10,16 @@ from experiments.probabilistic_dataflow.documents import Document
 from experiments.probabilistic_dataflow.mock_composition import (
     ACCEPT_TOKEN,
     CHEMISTRY_TASK,
+    COARSE_STAGE,
     DETAILED_PLAN_TOKEN,
     GEOMETRY_TASK,
     PLAN_TASK,
     QUERY_TOKEN,
+    REFINE_STAGE,
     REJECT_TOKEN,
-    TASK_CHANNEL,
+    RETRY_STAGE,
+    STAGE,
+    TASK,
     VERIFICATION_TASK,
     SpecialistResources,
     composition_program,
@@ -31,7 +35,7 @@ CHEMISTRY_TOKEN = 40
 def test_parallel_adaptive_specialists_complete_unequal_steps_before_verification() -> None:
     resources = SpecialistResources()
     result = run(
-        composition_program("sample", resources),
+        composition_program(resources),
         _scripted_executor(iter((ACCEPT_TOKEN,))),
     )
 
@@ -51,7 +55,7 @@ def test_parallel_adaptive_specialists_complete_unequal_steps_before_verificatio
 def test_composition_retries_geometry_with_previous_predictions() -> None:
     resources = SpecialistResources()
     result = run(
-        composition_program("sample", resources),
+        composition_program(resources),
         _scripted_executor(iter((REJECT_TOKEN, ACCEPT_TOKEN))),
     )
 
@@ -66,7 +70,7 @@ def test_composition_retries_geometry_with_previous_predictions() -> None:
         for document in exchange.documents
         if _query_task(document) == VERIFICATION_TASK
     ]
-    assert [document.token_ids for document in verification_documents] == [
+    assert [tuple(document.token_ids) for document in verification_documents] == [
         (REFINED_GEOMETRY_TOKEN, CHEMISTRY_TOKEN, QUERY_TOKEN),
         (RETRIED_GEOMETRY_TOKEN, CHEMISTRY_TOKEN, QUERY_TOKEN),
     ]
@@ -83,7 +87,7 @@ def test_parallel_specialist_resources_are_released_when_execution_fails() -> No
         return working_executor(documents)
 
     with pytest.raises(RuntimeError, match="specialist backend failed"):
-        run(composition_program("sample", resources), fail_during_specialists)
+        run(composition_program(resources), fail_during_specialists)
 
     assert resources.active == set()
     assert Counter(resources.acquired) == Counter({"geometry": 1, "chemistry": 1})
@@ -99,14 +103,16 @@ def _scripted_executor(verification_tokens: Iterator[int]) -> Executor:
             token = CHEMISTRY_TOKEN
         elif task == VERIFICATION_TASK:
             token = next(verification_tokens)
-        elif document.name.endswith("/coarse"):
-            token = COARSE_GEOMETRY_TOKEN
-        elif document.name.endswith("/refine"):
-            token = REFINED_GEOMETRY_TOKEN
-        elif document.name.endswith("/retry"):
-            token = RETRIED_GEOMETRY_TOKEN
+        elif task == GEOMETRY_TASK:
+            position = document.query_positions[0]
+            stage = int(document[STAGE][position])
+            token = {
+                COARSE_STAGE: COARSE_GEOMETRY_TOKEN,
+                REFINE_STAGE: REFINED_GEOMETRY_TOKEN,
+                RETRY_STAGE: RETRIED_GEOMETRY_TOKEN,
+            }[stage]
         else:
-            raise AssertionError(f"Unexpected document {document.name}")
+            raise AssertionError(f"Unexpected task {task}")
         return (Prediction(token, logprob=0.0),)
 
     return mapped_executor(predict)
@@ -118,4 +124,4 @@ def _query_tasks(exchanges: tuple[Exchange, ...]) -> tuple[tuple[int, ...], ...]
 
 def _query_task(document: Document) -> int:
     (position,) = document.query_positions
-    return dict(document.tokens[position].features)[TASK_CHANNEL]
+    return int(document[TASK][position])

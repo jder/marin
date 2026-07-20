@@ -16,16 +16,20 @@ from levanter.grug.sharding import compact_grug_mesh
 
 from experiments.grug.base.model import GrugModelConfig
 from experiments.probabilistic_dataflow.documents import (
+    POSITION_IDS,
+    QUERY,
+    TARGET_IDS,
+    TARGET_WEIGHTS,
     AttentionLayout,
+    Coordinate,
     Document,
     PackedBatch,
-    Token,
     causal_training_document,
     pack,
 )
 from experiments.probabilistic_dataflow.scientific_model import CrossDomainTransformer
 
-SCIENTIFIC_POSITION_CHANNEL = "scientific_position"
+SCIENTIFIC_POSITION = Coordinate("scientific_position")
 ADVECTION_CELLS = 4
 ADVECTION_STEPS = 3
 ADVECTION_CONTEXT_RECORDS = ADVECTION_CELLS + ADVECTION_CELLS * ADVECTION_STEPS
@@ -103,37 +107,28 @@ def synthetic_advection_document(codec: SyntheticTokenCodec, *, seed: int) -> Do
         future_steps.append(current)
     future = np.stack(future_steps)
 
-    example_id = f"advection-{seed}"
-    tokens = []
-    position = 0
-    for value in (*initial, *forcing.flat):
-        tokens.append(
-            Token(
-                codec.data(int(value)),
-                features=((SCIENTIFIC_POSITION_CHANNEL, position),),
-            )
-        )
-        position += 1
-    for value in future.flat:
-        tokens.append(
-            Token(
-                codec.QUERY_ID,
-                features=((SCIENTIFIC_POSITION_CHANNEL, position),),
-                query=True,
-                target_id=codec.data(int(value)),
-            )
-        )
-        position += 1
-    assert position == ADVECTION_RECORDS
-    return Document(example_id, tuple(tokens), AttentionLayout.FULL)
+    context_token_ids = tuple(codec.data(int(value)) for value in (*initial, *forcing.flat))
+    target_ids = tuple(codec.data(int(value)) for value in future.flat)
+    query_count = len(target_ids)
+    token_ids = context_token_ids + (codec.QUERY_ID,) * query_count
+    context_count = len(context_token_ids)
+    return Document(
+        token_ids,
+        {
+            SCIENTIFIC_POSITION: np.arange(ADVECTION_RECORDS, dtype=SCIENTIFIC_POSITION.dtype),
+            QUERY: (False,) * context_count + (True,) * query_count,
+            TARGET_IDS: (TARGET_IDS.missing,) * context_count + target_ids,
+        },
+        attention=AttentionLayout.FULL,
+    )
 
 
 def record_order_equivariance_error(*, seed: int = 0) -> float:
     """Measure the maximum logit change after permuting and restoring scientific records."""
     codec = SyntheticTokenCodec()
     document = synthetic_advection_document(codec, seed=seed)
-    order = tuple(int(index) for index in np.random.default_rng(seed).permutation(len(document.tokens)))
-    permuted = document.reordered(order)
+    order = tuple(int(index) for index in np.random.default_rng(seed).permutation(len(document)))
+    permuted = document.take(order)
     config = GrugModelConfig(
         vocab_size=codec.vocab_size,
         hidden_dim=16,
@@ -141,7 +136,7 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
         num_layers=2,
         num_heads=4,
         num_kv_heads=2,
-        max_seq_len=len(document.tokens),
+        max_seq_len=len(document),
     )
     with jax.set_mesh(compact_grug_mesh()):
         model = CrossDomainTransformer.init(
@@ -149,19 +144,19 @@ def record_order_equivariance_error(*, seed: int = 0) -> float:
             scientific_position_count=ADVECTION_RECORDS,
             key=jax.random.PRNGKey(seed),
         )
-        segment_ids = jnp.zeros((1, len(document.tokens)), dtype=jnp.int32)
+        segment_ids = jnp.zeros((1, len(document)), dtype=jnp.int32)
         mask = AttentionMask().with_segment_ids(segment_ids)
         logits = model.logits(
             jnp.asarray((document.token_ids,)),
-            jnp.asarray((document.feature_ids(SCIENTIFIC_POSITION_CHANNEL),)),
+            jnp.asarray((document[SCIENTIFIC_POSITION],)),
             mask=mask,
-            rotary_position_ids=jnp.asarray((document.rotary_position_ids,)),
+            rotary_position_ids=jnp.asarray((document[POSITION_IDS],)),
         )
         permuted_logits = model.logits(
             jnp.asarray((permuted.token_ids,)),
-            jnp.asarray((permuted.feature_ids(SCIENTIFIC_POSITION_CHANNEL),)),
+            jnp.asarray((permuted[SCIENTIFIC_POSITION],)),
             mask=mask,
-            rotary_position_ids=jnp.asarray((permuted.rotary_position_ids,)),
+            rotary_position_ids=jnp.asarray((permuted[POSITION_IDS],)),
         )
     inverse = np.argsort(np.asarray(order))
     restored_logits = np.asarray(permuted_logits)[:, inverse]
@@ -173,13 +168,7 @@ def build_synthetic_text_batch(codec: SyntheticTokenCodec, *, repetitions: int =
     if repetitions <= 0:
         raise ValueError(f"repetitions must be positive, got {repetitions}")
     sentences = [sentence for _ in range(repetitions) for sentence in TEXT_SENTENCES]
-    documents = tuple(
-        causal_training_document(
-            f"text-{index}",
-            tuple(codec.token(word) for word in sentence),
-        )
-        for index, sentence in enumerate(sentences)
-    )
+    documents = tuple(causal_training_document(tuple(codec.token(word) for word in sentence)) for sentence in sentences)
     return pack(documents, max_seq_len=len(TEXT_SENTENCES[0]))
 
 
@@ -261,14 +250,14 @@ def train_cross_domain_smoke(
         final_loss=float(final_text[0]),
         initial_accuracy=float(initial_text[1]),
         final_accuracy=float(final_text[1]),
-        supervised_tokens=int(np.sum(text_batch.loss_weights)),
+        supervised_tokens=int(np.sum(text_batch[TARGET_WEIGHTS])),
     )
     science_metrics = TaskTrainingMetrics(
         initial_loss=float(initial_science[0]),
         final_loss=float(final_science[0]),
         initial_accuracy=float(initial_science[1]),
         final_accuracy=float(final_science[1]),
-        supervised_tokens=int(np.sum(science_batch.loss_weights)),
+        supervised_tokens=int(np.sum(science_batch[TARGET_WEIGHTS])),
     )
     return CrossDomainTrainingResult(
         initial_loss=0.5 * (text_metrics.initial_loss + science_metrics.initial_loss),
@@ -315,16 +304,16 @@ def _aligned_metrics(
 def _task_arrays(batch: PackedBatch) -> tuple[jax.Array, ...]:
     return (
         jnp.asarray(batch.token_ids),
-        jnp.asarray(batch.feature_ids(SCIENTIFIC_POSITION_CHANNEL)),
-        jnp.asarray(batch.rotary_position_ids),
-        jnp.asarray(batch.target_ids),
-        jnp.asarray(batch.loss_weights),
+        jnp.asarray(batch[SCIENTIFIC_POSITION]),
+        jnp.asarray(batch[POSITION_IDS]),
+        jnp.asarray(batch[TARGET_IDS]),
+        jnp.asarray(batch[TARGET_WEIGHTS]),
         jnp.asarray(batch.segment_ids),
     )
 
 
 def _task_attention_mask(batch: PackedBatch, segment_ids: jax.Array) -> AttentionMask:
-    if batch.attention_layout == AttentionLayout.CAUSAL:
+    if batch.attention == AttentionLayout.CAUSAL:
         return AttentionMask.causal().with_segment_ids(segment_ids)
     return AttentionMask().with_segment_ids(segment_ids)
 

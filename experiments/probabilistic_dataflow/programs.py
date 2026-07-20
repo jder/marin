@@ -12,7 +12,13 @@ from typing import Any, Generic, Protocol, TypeVar, overload
 
 import numpy as np
 
-from experiments.probabilistic_dataflow.documents import AttentionLayout, Document, PackedBatch, pack
+from experiments.probabilistic_dataflow.documents import (
+    QUERY,
+    AttentionLayout,
+    Document,
+    PackedBatch,
+    pack,
+)
 
 T = TypeVar("T")
 T1 = TypeVar("T1")
@@ -286,7 +292,7 @@ def packed_executor(
     def execute(documents: tuple[Document, ...]) -> tuple[Result, ...]:
         grouped: dict[AttentionLayout, list[tuple[int, Document]]] = {}
         for document_index, document in enumerate(documents):
-            grouped.setdefault(document.attention_layout, []).append((document_index, document))
+            grouped.setdefault(document.attention, []).append((document_index, document))
 
         predictions: list[list[Prediction]] = [[] for _ in documents]
         for items in grouped.values():
@@ -300,7 +306,7 @@ def packed_executor(
                 raise ValueError(
                     f"Packed sample logprobs must have shape {batch.token_ids.shape}, got {samples.logprobs.shape}"
                 )
-            for row, position in np.argwhere(batch.query_mask):
+            for row, position in np.argwhere(batch[QUERY]):
                 local_document_index = int(batch.document_indices[row, position])
                 document_index = items[local_document_index][0]
                 predictions[document_index].append(
@@ -325,16 +331,16 @@ def _validate_results(
     results: tuple[Result, ...],
     accepted_origins: frozenset[Origin],
 ) -> None:
-    for document, result in zip(documents, results, strict=True):
+    for document_index, (document, result) in enumerate(zip(documents, results, strict=True)):
         if result.origin not in accepted_origins:
             raise ValueError(
-                f"Result for document {document.name!r} has origin {result.origin.value!r}; "
+                f"Result for document {document_index} has origin {result.origin.value!r}; "
                 f"accepted origins are {sorted(accepted_origins)}"
             )
         expected_predictions = len(document.query_positions)
         if len(result.predictions) != expected_predictions:
             raise ValueError(
-                f"Result for document {document.name!r} returned {len(result.predictions)} predictions, "
+                f"Result for document {document_index} returned {len(result.predictions)} predictions, "
                 f"expected {expected_predictions}"
             )
 
